@@ -1975,7 +1975,9 @@ struct InkCudaRunner {
             INK_CK(ink_cuda_mem_info(&vfree, &vtot, m.primary_gpu));
             tree_cap = (max_slots <= 4 && vfree > (700ull << 20)) ? kInkMaxTree : 16;
             max_batch = std::max(max_batch, tree_cap);
-            if (vfree < (2200ull << 20) && max_batch > 512) {
+            const size_t mb512_thresh = (m.sm_cc >= 80 && kv_dtype != InkKvDtype::FP16 && max_slots == 1)
+                                      ? (1050ull << 20) : (2200ull << 20);
+            if (vfree < mb512_thresh && max_batch > 512) {
                 max_batch = 512;
                 swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
             }
@@ -1998,7 +2000,7 @@ struct InkCudaRunner {
             const size_t base_ws_res = (max_slots >= 8) ? (1280ull << 20)
                                      : (vtot <= (18ull << 30) && max_slots == 1)
                                          ? ((m.sm_cc >= 80)
-                                             ? ((max_batch <= 256) ? (256ull << 20) : (368ull << 20))
+                                             ? ((max_batch <= 256) ? (256ull << 20) : ((max_batch <= 512) ? (368ull << 20) : (640ull << 20)))
                                              : ((max_batch <= 256) ? (448ull << 20) : (560ull << 20)))
                                          : (768ull << 20);
             const size_t dspark_ws_res = m.man.has_dspark
