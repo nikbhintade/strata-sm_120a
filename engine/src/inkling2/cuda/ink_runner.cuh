@@ -1697,6 +1697,7 @@ struct InkCudaRunner {
     float* d_sconv_pool[kInkVisits] = {};
 
     // Activation workspaces
+    bool depth_bf16 = false;          // sm_80+ single-GPU: store d_blocks, d_bank, d_bank_out in BF16 (2x less VRAM & BW!)
     float *d_cur = nullptr, *d_prelude = nullptr;
     float *d_blocks[8] = {};          // attention-residual block bank (max 6 needed)
     float *d_bank[4] = {};            // saved previous-pass core blocks
@@ -2000,7 +2001,7 @@ struct InkCudaRunner {
             const size_t base_ws_res = (max_slots >= 8) ? (1280ull << 20)
                                      : (vtot <= (18ull << 30) && max_slots == 1)
                                          ? ((m.sm_cc >= 80)
-                                             ? ((max_batch <= 256) ? (240ull << 20) : ((max_batch <= 512) ? (320ull << 20) : (512ull << 20)))
+                                             ? ((max_batch <= 256) ? (224ull << 20) : ((max_batch <= 512) ? (288ull << 20) : (448ull << 20)))
                                              : ((max_batch <= 256) ? (448ull << 20) : (560ull << 20)))
                                          : (768ull << 20);
             const size_t dspark_ws_res = m.man.has_dspark
@@ -2122,12 +2123,14 @@ struct InkCudaRunner {
         INK_CK(cudaSetDevice(m.primary_gpu));
 
         const size_t MB = (size_t)max_batch;
+        depth_bf16 = (m.sm_cc >= 80 && !m.ls_active);
+        const size_t depth_f32_cnt = depth_bf16 ? ((MB * kInkHidden + 1u) / 2u) : (MB * kInkHidden);
         d_cur       = dalloc<float>(MB * kInkHidden);
         d_prelude   = dalloc<float>(MB * kInkHidden);
-        d_bank_out  = dalloc<float>(MB * kInkHidden);
+        d_bank_out  = dalloc<float>(depth_f32_cnt);
         const int n_blk_alloc = std::min(8, std::max(6, (m.man.c.n_phys + m.man.c.block_size - 1) / std::max(1, m.man.c.block_size)));
-        for (int i = 0; i < n_blk_alloc; ++i) d_blocks[i] = dalloc<float>(MB * kInkHidden);
-        for (int i = 0; i < 4; ++i) d_bank[i] = dalloc<float>(MB * kInkHidden);
+        for (int i = 0; i < n_blk_alloc; ++i) d_blocks[i] = dalloc<float>(depth_f32_cnt);
+        for (int i = 0; i < 4; ++i) d_bank[i] = dalloc<float>(depth_f32_cnt);
         d_mixed     = dalloc<float>(3 * MB * kInkHidden);
         d_msgs      = dalloc<float>(4 * MB * kInkHidden);
         d_inp0      = dalloc<float>(MB * kInkHidden);
@@ -2154,13 +2157,15 @@ struct InkCudaRunner {
             d_taps[i]         = dalloc<float>(MB * kInkHidden);
             d_taps_compact[i] = dalloc<float>((size_t)tree_cap * kInkHidden);
         }
-        const size_t ctrl_cat_f32 = (m.ctrl_is_bf16 && m.sm_cc >= 80 && !m.ls_active)
+        const bool ctrl_bf16_pf = (m.ctrl_is_bf16 && m.sm_cc >= 80 && !m.ls_active);
+        const size_t ctrl_cat_f32 = ctrl_bf16_pf
                                   ? std::max<size_t>(3ull * MB * kInkHidden, 3ull * 16 * 2 * kInkHidden)
                                   : (3ull * MB * 2 * kInkHidden);
+        const size_t ctrl_gf_f32  = ctrl_bf16_pf ? std::max<size_t>((MB * kInkHidden + 1u) / 2u, 64ull * 64) : (MB * kInkHidden);
         d_ctrl_cat    = dalloc<float>(ctrl_cat_f32);
         d_ctrl_gate   = dalloc<float>(3ull * MB * kInkGateRank);
-        d_ctrl_gain   = dalloc<float>(MB * kInkHidden);
-        d_ctrl_forget = dalloc<float>(MB * kInkHidden);
+        d_ctrl_gain   = dalloc<float>(ctrl_gf_f32);
+        d_ctrl_forget = dalloc<float>(ctrl_gf_f32);
         const size_t sp_cap = std::max<size_t>((size_t)kInkAttnMaxSplits, (size_t)tree_cap * kInkAttnSplits);
         d_attn_pm     = dalloc<float>(sp_cap * kInkHeads);
         d_attn_pl     = dalloc<float>(sp_cap * kInkHeads);
@@ -2187,6 +2192,9 @@ struct InkCudaRunner {
                 cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64, 64, 64, &a,
                              d_w_scratch, CUDA_R_16BF, 64, d_x_bf16, CUDA_R_16BF, 64, &b,
                              d_ctrl_gain, CUDA_R_32F, 64, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64, 64, 64, &a,
+                             d_w_scratch, CUDA_R_16BF, 64, d_x_bf16, CUDA_R_16BF, 64, &b,
+                             d_ctrl_gain, CUDA_R_16BF, 64, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
             } else if (m.sm_cc >= 70) {
                 cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 64, 64, 64, &a,
                              d_w_scratch, CUDA_R_16F, 64, d_x_bf16, CUDA_R_16F, 64, &b,
@@ -2589,20 +2597,23 @@ struct InkCudaRunner {
                     k_ink_f32_to_bf16<<<((nx_d + 3) / 4 + 255) / 256, 256, 0, st>>>(reinterpret_cast<const float*>(cat_raw), d_x_bf16, nx_d);
                     cat_b = d_x_bf16;
                 }
+                auto* gate_b   = reinterpret_cast<__nv_bfloat16*>(d_ctrl_gate);
+                auto* gain_b   = reinterpret_cast<__nv_bfloat16*>(d_ctrl_gain);
+                auto* forget_b = reinterpret_cast<__nv_bfloat16*>(d_ctrl_forget);
                 INK_CUBLAS_CK(cublasGemmEx(
                     cublas, CUBLAS_OP_T, CUBLAS_OP_N, kInkGateRank, M, D2, &alpha,
                     wd, CUDA_R_16BF, D2, cat_b, CUDA_R_16BF, D2, &beta,
-                    d_ctrl_gate, CUDA_R_32F, kInkGateRank, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                const size_t nx_g = (size_t)M * kInkGateRank;
-                k_ink_f32_to_bf16<<<((nx_g + 3) / 4 + 255) / 256, 256, 0, st>>>(d_ctrl_gate, d_x_bf16, nx_g);
+                    gate_b, CUDA_R_16BF, kInkGateRank, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
                 INK_CUBLAS_CK(cublasGemmEx(
                     cublas, CUBLAS_OP_T, CUBLAS_OP_N, D, M, kInkGateRank, &alpha,
-                    wg, CUDA_R_16BF, kInkGateRank, d_x_bf16, CUDA_R_16BF, kInkGateRank, &beta,
-                    d_ctrl_gain, CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    wg, CUDA_R_16BF, kInkGateRank, gate_b, CUDA_R_16BF, kInkGateRank, &beta,
+                    gain_b, CUDA_R_16BF, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
                 INK_CUBLAS_CK(cublasGemmEx(
                     cublas, CUBLAS_OP_T, CUBLAS_OP_N, D, M, kInkGateRank, &alpha,
-                    wf, CUDA_R_16BF, kInkGateRank, d_x_bf16, CUDA_R_16BF, kInkGateRank, &beta,
-                    d_ctrl_forget, CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    wf, CUDA_R_16BF, kInkGateRank, gate_b, CUDA_R_16BF, kInkGateRank, &beta,
+                    forget_b, CUDA_R_16BF, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                k_ink_ctrl_blend_norm_bf16<<<M, 256, 0, st>>>(cur, msg, gain_b, forget_b, norm_w, out, M, D);
+                return;
             } else if (!exact_fp32 && m.sm_cc >= 70 && m.sm_cc < 80) {
                 const float* cat      = reinterpret_cast<const float*>(cat_raw);
                 const float* w_down   = reinterpret_cast<const float*>(w_down_raw);
@@ -3058,6 +3069,7 @@ struct InkCudaRunner {
             for (int b = 0; b < n_blocks; ++b) stp.p[b] = block_ptrs[b];
             stp.p[n_blocks] = d_cur;
             stp.count = n_blocks + 1;
+            stp.bf16_mask = depth_bf16 ? (uint8_t)((1u << n_blocks) - 1u) : 0u;
             const float* q_res = (const float*)m.trunk_ptr_stage(cur_stage, "model.llm.attn_res.attn_queries." + std::to_string(ip - 1));
             const int nq = is_swa ? 1 : 3;
             if (!has_msg) {
@@ -3067,12 +3079,19 @@ struct InkCudaRunner {
                 in_v = is_swa ? d_mixed : (d_mixed + 2 * n_hid);
             } else {
                 const bool pf_cat_bf16 = (M > 16) && m.ctrl_is_bf16 && (m.sm_cc >= 80);
-                k_ink_attn_res_3x_cat_rms<<<dim3(M, 4), 256, 0, st>>>(
-                    stp, q_res, is_swa, *bank_stp, m.d_msg_queries[ip - m.man.c.core_start],
-                    d_mixed, d_msgs, d_ctrl_cat, M, kInkHidden, pf_cat_bf16);
+                const bool use_1cta_pf = (M > 16) && (kInkHidden <= 3072);
+                if (use_1cta_pf) {
+                    k_ink_attn_res_3x_cat_rms_pf<<<M, 256, 0, st>>>(
+                        stp, q_res, is_swa, *bank_stp, m.d_msg_queries[ip - m.man.c.core_start],
+                        d_mixed, d_msgs, d_ctrl_cat, M, kInkHidden, pf_cat_bf16);
+                } else {
+                    k_ink_attn_res_3x_cat_rms<<<dim3(M, 4), 256, 0, st>>>(
+                        stp, q_res, is_swa, *bank_stp, m.d_msg_queries[ip - m.man.c.core_start],
+                        d_mixed, d_msgs, d_ctrl_cat, M, kInkHidden, pf_cat_bf16);
+                }
                 const float* src0 = d_mixed;
-                const float* src1 = d_mixed + 1 * n_hid;
-                const float* src2 = d_mixed + 2 * n_hid;
+                const float* src1 = (use_1cta_pf && is_swa) ? d_mixed : (d_mixed + 1 * n_hid);
+                const float* src2 = (use_1cta_pf && is_swa) ? d_mixed : (d_mixed + 2 * n_hid);
                 const void* wd0 = m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.down_weight");
                 const void* wg0 = m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.gain_weight");
                 const void* wf0 = m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.forget_weight");
@@ -3356,7 +3375,12 @@ struct InkCudaRunner {
         linear(p + ".attn.wo_ud.weight", d_attn_out, d_wo_raw, M, 0, false, (mode == 2));
         prof_mark_end(4); prof_mark_start();
         if (ip % m.man.c.block_size == 0) {
-            INK_CK(cudaMemcpyAsync(d_blocks[n_blocks], d_cur, n_hid * 4, cudaMemcpyDeviceToDevice, st));
+            if (depth_bf16) {
+                k_ink_f32_to_bf16<<<((n_hid + 3) / 4 + 255) / 256, 256, 0, st>>>(
+                    d_cur, reinterpret_cast<__nv_bfloat16*>(d_blocks[n_blocks]), n_hid);
+            } else {
+                INK_CK(cudaMemcpyAsync(d_blocks[n_blocks], d_cur, n_hid * 4, cudaMemcpyDeviceToDevice, st));
+            }
             block_ptrs[n_blocks] = d_blocks[n_blocks];
             ++n_blocks;
             run_sconv_uniform(d_wo_raw, m.d_sconv_attn[ip], nullptr, d_cur, kInkHidden, 2 * kInkKVDim, 0, false);
@@ -3371,6 +3395,7 @@ struct InkCudaRunner {
             for (int b = 0; b < n_blocks; ++b) stp.p[b] = block_ptrs[b];
             stp.p[n_blocks] = d_cur;
             stp.count = n_blocks + 1;
+            stp.bf16_mask = depth_bf16 ? (uint8_t)((1u << n_blocks) - 1u) : 0u;
             const float* q_mlp = (const float*)m.trunk_ptr_stage(cur_stage, "model.llm.attn_res.mlp_queries." + std::to_string(ip));
             if (has_msg) {
                 const bool pf_cat_bf16 = (M > 16) && m.ctrl_is_bf16 && (m.sm_cc >= 80);
@@ -3535,10 +3560,16 @@ struct InkCudaRunner {
                     switch_stage_handoff(0, M, mode, n_blocks, block_ptrs, nullptr, 0);
                 }
                 n_bank = n_blocks - (n_pre_blk + 1);
+                const size_t blk_bytes = n_hid * (depth_bf16 ? 2u : 4u);
                 for (int b = 0; b < n_bank; ++b) {
-                    INK_CK(cudaMemcpyAsync(d_bank[b], block_ptrs[n_pre_blk + 1 + b], n_hid * 4, cudaMemcpyDeviceToDevice, st));
+                    INK_CK(cudaMemcpyAsync(d_bank[b], block_ptrs[n_pre_blk + 1 + b], blk_bytes, cudaMemcpyDeviceToDevice, st));
                 }
-                INK_CK(cudaMemcpyAsync(d_bank_out, d_cur, n_hid * 4, cudaMemcpyDeviceToDevice, st));
+                if (depth_bf16) {
+                    k_ink_f32_to_bf16<<<((n_hid + 3) / 4 + 255) / 256, 256, 0, st>>>(
+                        d_cur, reinterpret_cast<__nv_bfloat16*>(d_bank_out), n_hid);
+                } else {
+                    INK_CK(cudaMemcpyAsync(d_bank_out, d_cur, n_hid * 4, cudaMemcpyDeviceToDevice, st));
+                }
                 INK_CK(cudaMemcpyAsync(d_cur, d_prelude, n_hid * 4, cudaMemcpyDeviceToDevice, st));
                 n_blocks = n_pre_blk;
                 for (int b = 0; b < n_pre_blk; ++b) {
@@ -3550,6 +3581,7 @@ struct InkCudaRunner {
                 for (int b = 0; b < n_bank; ++b) bst.p[b] = d_bank[b];
                 bst.p[n_bank] = d_bank_out;
                 bst.count = n_bank + 1;
+                bst.bf16_mask = depth_bf16 ? (uint8_t)((1u << (n_bank + 1)) - 1u) : 0u;
             }
             for (int ip = m.man.c.core_start; ip < m.man.c.core_end; ++ip) {
                 if (m.ls_active && m.layer_owner[ip] != cur_stage) {
@@ -3581,6 +3613,7 @@ struct InkCudaRunner {
             for (int b = 0; b < n_blocks; ++b) stp.p[b] = block_ptrs[b];
             stp.p[n_blocks] = d_cur;
             stp.count = n_blocks + 1;
+            stp.bf16_mask = depth_bf16 ? (uint8_t)((1u << n_blocks) - 1u) : 0u;
             k_ink_attn_res_mix<<<M, 256, 0, st>>>(stp, (const float*)m.trunk_ptr("model.llm.attn_res.output_query"), d_moe_in, 1, M, kInkHidden);
             k_ink_rms_norm<<<M, 256, 0, st>>>(d_moe_in, (const float*)m.trunk_ptr("model.llm.norm.weight"), d_h_norm, nullptr, M, kInkHidden);
             if (want_taps) INK_CK(cudaMemcpyAsync(d_taps[3], d_h_norm, n_hid * 4, cudaMemcpyDeviceToDevice, st));
