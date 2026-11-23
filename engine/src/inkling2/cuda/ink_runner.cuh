@@ -1142,7 +1142,7 @@ struct InkCudaModel {
         INK_CK(ink_cuda_mem_info(&vf0, &vt0, primary_gpu));
         const size_t wddm_floor0 = wddm_safety_floor(vt0);
         const size_t base_res0 = ((vt0 >= (20ull << 30)) ? (1600ull << 20)
-                                : (vt0 <= (13ull << 30)) ? (960ull << 20) : (1280ull << 20))
+                                : (vt0 <= (18ull << 30)) ? (960ull << 20) : (1280ull << 20))
                                + (wddm_floor0 > (512ull << 20) ? (wddm_floor0 - (512ull << 20)) : 0ull);
         const size_t res0 = std::max(base_res0, extra_reserve_bytes + wddm_floor0);
         const size_t bud0 = (vf0 > res0) ? (vf0 - res0) : 0;

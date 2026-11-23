@@ -1275,7 +1275,7 @@ struct InkDSpark {
         const bool pack_ho = (cache_is_fp16 || m.tinfo(ho_w).fmt != FMT_BF16);
         if (pack_rn) tot_elems += (size_t)m.tinfo(rn_w).rows() * m.tinfo(rn_w).cols();
         if (pack_ho) tot_elems += (size_t)m.tinfo(ho_w).rows() * m.tinfo(ho_w).cols();
-        if (m.sm_cc >= 70 && vfree > tot_elems * 2 + (768ull << 20)) {
+        if (m.sm_cc >= 70 && vfree > tot_elems * 2 + (256ull << 20)) {
             d_bf16_pool = dalloc<uint16_t>(tot_elems);
             size_t cur = 0;
             for (int il = 0; il < 3; ++il) {
