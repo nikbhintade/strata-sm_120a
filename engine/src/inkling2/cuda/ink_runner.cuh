@@ -3499,8 +3499,8 @@ struct InkCudaRunner {
     }
 
     // ---- Unembed + Softcap(30.0) + Argmax ----
-    // Fast exact 2-stage screened argmax (0.14 ms on RTX 5090, 100.000% mathematically bit-exact up to M <= 32!)
-    void head_argmax_exact(int M, int32_t* h_out_ids) {
+    // Fast exact 2-stage screened argmax (or direct register-dequantized S_K GEMV when screen=0)
+    void head_argmax_exact_from(const float* d_h_src, int M, int32_t* h_out_ids) {
         prof_mark_start();
         const auto& ui = m.tinfo("model.llm.unembed.weight");
         if (m.unembed_screen.ready && (ui.fmt == FMT_BF16 || ui.fmt == FMT_S6_K) && M <= kInkMaxTree) {
@@ -3508,7 +3508,7 @@ struct InkCudaRunner {
             const int g1 = (V + 7) / 8;
             for (int m0 = 0; m0 < M; m0 += 8) {
                 const int mc = std::min(8, M - m0);
-                const float* hm = d_h_norm + (size_t)m0 * kInkHidden;
+                const float* hm = d_h_src + (size_t)m0 * kInkHidden;
                 k_ink_row_l2norm<<<mc, 256, 0, st>>>(hm, d_h_norm2, d_max_lb, d_cand_cnt, mc);
                 if (mc == 1) {
                     k_ink_screen_pass1_multiM<1><<<g1, 256, 0, st>>>(
@@ -3540,11 +3540,18 @@ struct InkCudaRunner {
             INK_CK(cudaStreamSynchronize(st));
             return;
         }
-        head_logits_full(M);
-        k_ink_argmax_rows<<<M, 1024, 0, st>>>(d_logits, m.man.c.vocab_unpadded, d_argmax);
+        // Softcap tanh(x / c) * c is strictly monotonic -> argmax(raw) == argmax(softcapped), skip softcap kernel!
+        ensure_logits(M);
+        const int V = m.man.c.vocab_unpadded;
+        linear("model.llm.unembed.weight", d_h_src, d_logits, M, V);
+        k_ink_argmax_rows<<<M, 1024, 0, st>>>(d_logits, V, d_argmax);
         prof_mark_end(7);
         INK_CK(cudaMemcpyAsync(h_out_ids, d_argmax, (size_t)M * 4, cudaMemcpyDeviceToHost, st));
         INK_CK(cudaStreamSynchronize(st));
+    }
+
+    void head_argmax_exact(int M, int32_t* h_out_ids) {
+        head_argmax_exact_from(d_h_norm, M, h_out_ids);
     }
 
     // Full exact softcapped logits [n_want, 200058] for selected hidden rows in d_h_src -> d_logits

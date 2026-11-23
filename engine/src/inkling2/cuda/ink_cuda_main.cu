@@ -169,9 +169,8 @@ int main(int argc, char** argv) {
             std::printf("[DUMP] Wrote %d x %d float32 logits to %s\n", last_chunk, V, dump_logits_path.c_str());
         }
     }
-    std::vector<int32_t> arg_buf(last_chunk);
-    runner.head_argmax_exact(last_chunk, arg_buf.data());
-    int32_t first_tok = arg_buf[last_chunk - 1];
+    int32_t first_tok = 0;
+    runner.head_argmax_exact_from(runner.d_h_norm + (size_t)(last_chunk - 1) * kInkHidden, 1, &first_tok);
     std::printf("First greedy token after prompt: %d\n", first_tok);
 
     // ---- 2. Single-Stream Plain Decode Benchmark ----
