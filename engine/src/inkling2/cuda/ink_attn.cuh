@@ -53,6 +53,42 @@ struct InkKvVisitDesc {
     uint8_t  kv_fmt;     // 0=FP16, 1=FP8, 2=K8V8, 3=K8V4
 };
 
+// Dedicated K-only or V-only 4-dim KV loader (avoids reading V during K-tile load and vice versa -> 2x less KV BW in FA2!)
+template <bool LOAD_V>
+__device__ __forceinline__ float4 ink_kv_load4_half(
+    const InkKvVisitDesc& kv, int sl, int p_idx, int kh, int lane) {
+    const bool use_host = (!kv.is_swa && kv.host_cap > 0 && p_idx >= kv.dev_cap);
+    const int stride = use_host ? kv.host_cap : (kv.host_cap > 0 ? kv.dev_cap : kv.cap_pos);
+    const int pos_l  = use_host ? (p_idx - kv.dev_cap) : p_idx;
+    const size_t hbase = ((size_t)sl * stride + pos_l) * kInkKVHeads + kh;
+    const size_t base  = hbase * kInkHeadDim + (size_t)lane * 4;
+    if (kv.kv_fmt == 0) {
+        const __half* ptr = LOAD_V ? (use_host ? kv.h_v_f16 : kv.v_f16) : (use_host ? kv.h_k_f16 : kv.k_f16);
+        const uint2 u2 = *(const uint2*)(ptr + base);
+        const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&u2.x));
+        const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&u2.y));
+        return make_float4(f0.x, f0.y, f1.x, f1.y);
+    }
+    const uint8_t* ptr8 = LOAD_V ? (use_host ? kv.h_v_f8 : kv.v_f8) : (use_host ? kv.h_k_f8 : kv.k_f8);
+    const float sc = (LOAD_V ? (use_host ? kv.h_v_sc : kv.v_sc) : (use_host ? kv.h_k_sc : kv.k_sc))[hbase];
+    if (kv.kv_fmt == 1) {
+        const uint32_t u4 = *(const uint32_t*)(ptr8 + base);
+        const float2 f0 = e4m3x2_to_f32x2((uint16_t)(u4 & 0xFFFFu));
+        const float2 f1 = e4m3x2_to_f32x2((uint16_t)(u4 >> 16));
+        return make_float4(f0.x * sc, f0.y * sc, f1.x * sc, f1.y * sc);
+    }
+    if (kv.kv_fmt == 2 || !LOAD_V) {
+        const uint32_t u4 = *(const uint32_t*)(ptr8 + base);
+        return make_float4((float)(int8_t)(u4 & 0xFFu) * sc, (float)(int8_t)((u4 >> 8) & 0xFFu) * sc,
+                           (float)(int8_t)((u4 >> 16) & 0xFFu) * sc, (float)(int8_t)(u4 >> 24) * sc);
+    }
+    const uint16_t vp = *(const uint16_t*)(ptr8 + hbase * (kInkHeadDim / 2) + (size_t)lane * 2);
+    return make_float4((float)((int)(vp & 0xFu) - 8) * sc,
+                       (float)((int)((vp >> 4) & 0xFu) - 8) * sc,
+                       (float)((int)((vp >> 8) & 0xFu) - 8) * sc,
+                       (float)((int)((vp >> 12) & 0xFu) - 8) * sc);
+}
+
 // Unified inline 4-dim KV loader for all 4 formats (FP16 / FP8 / K8V8 / K8V4) + transparent Host KV Offload!
 __device__ __forceinline__ void ink_kv_load4(
     const InkKvVisitDesc& kv, int sl, int p_idx, int kh, int lane, float4& kv4, float4& vv4) {
@@ -1098,6 +1134,488 @@ __global__ void __launch_bounds__(128) k_ink_pf_accum_tile(
         const size_t ob = ((size_t)(q0 + ci) * kInkHeads + h) * kInkHeadDim + d;
         if (gate_attn) res *= 1.0f / (1.0f + __expf(-gate_attn[ob]));
         out[ob] = res;
+    }
+}
+
+// ============================================================================
+// True Zero-VRAM Fused FlashAttention-2 GQA-3 Prefill Kernel (sm_80..sm_121!)
+//   - 1 CTA = 1 KV head x ALL 3 GQA Q-heads x BR=32 query tokens, BC=32 (6 warps = 192 threads, 45 KB static SMEM -> 2 CTAs/SM!)
+//   - XOR-swizzled SMEM + ldmatrix.m8n8.x4 / ldmatrix.m8n8.x4.trans + mma.sync.aligned.m16n8k16.bf16!
+//   - Hardware cvt.rn.f16x2.e4m3x2 FP8 KV decode + ex2.approx.ftz.f32 + skip O*=1.0f!
+//   - Inline RelPos (s_R @ s_RP in SMEM) -> eliminates k_ink_rel_table launch AND 50.4 MiB d_rel_table DRAM round-trip!
+//   - 2-phase loop: zero-branch far Global interior (dist >= 1024 -> rel_bias == 0) + near/boundary causal/SWA-1024!
+//   - Frees BOTH 114 MiB d_pf_* workspace AND 47 MiB d_rel_table (total 161 MiB freed -> 20K+ VRAM FP8 KV)!
+// ============================================================================
+__device__ __forceinline__ void ink_mma_m16n8k16_bf16(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    (void)d0; (void)d1; (void)d2; (void)d3;
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
+#endif
+}
+
+__device__ __forceinline__ uint32_t ink_pack_bf16x2(float x, float y) {
+    const __nv_bfloat162 b = __floats2bfloat162_rn(x, y);
+    return *reinterpret_cast<const uint32_t*>(&b);
+}
+
+__device__ __forceinline__ float ink_fa2_ex2(float x) {
+    float r;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+__device__ __forceinline__ void ink_fa2_ldm4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+#else
+    (void)r0; (void)r1; (void)r2; (void)r3; (void)p;
+#endif
+}
+
+__device__ __forceinline__ void ink_fa2_ldm4_t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+#else
+    (void)r0; (void)r1; (void)r2; (void)r3; (void)p;
+#endif
+}
+
+__device__ __forceinline__ int ink_fa2_swz(int row, int col8) {
+    return (col8 ^ (row & 7)) * 8;
+}
+
+__device__ __forceinline__ float ink_fa2_dot16_h2(const __half2 (&a)[8], const __half2* b) {
+    __half2 s0 = __hmul2(a[0], b[0]);
+    __half2 s1 = __hmul2(a[1], b[1]);
+    s0 = __hfma2(a[2], b[2], s0); s1 = __hfma2(a[3], b[3], s1);
+    s0 = __hfma2(a[4], b[4], s0); s1 = __hfma2(a[5], b[5], s1);
+    s0 = __hfma2(a[6], b[6], s0); s1 = __hfma2(a[7], b[7], s1);
+    s0 = __hadd2(s0, s1);
+    const float2 f = __half22float2(s0);
+    return f.x + f.y;
+}
+
+template <int KV_FMT, bool HAS_HOST, bool LOAD_V>
+__device__ __forceinline__ void ink_fa2_load_kv4_bf16x2(
+    const InkKvVisitDesc& kv, int sl, int p_idx, int kh, int lane, uint32_t& out0, uint32_t& out1) {
+    if constexpr (KV_FMT == 1) {
+        const bool use_host = HAS_HOST && (!kv.is_swa && p_idx >= kv.dev_cap);
+        const int stride = use_host ? kv.host_cap : (HAS_HOST ? kv.dev_cap : kv.cap_pos);
+        const int pos_l  = use_host ? (p_idx - kv.dev_cap) : p_idx;
+        const size_t hbase = ((size_t)sl * stride + pos_l) * kInkKVHeads + kh;
+        const size_t base  = hbase * kInkHeadDim + (size_t)lane * 4;
+        const uint8_t* ptr8 = LOAD_V ? (use_host ? kv.h_v_f8 : kv.v_f8) : (use_host ? kv.h_k_f8 : kv.k_f8);
+        const float sc = (LOAD_V ? (use_host ? kv.h_v_sc : kv.v_sc) : (use_host ? kv.h_k_sc : kv.k_sc))[hbase];
+        const uint32_t u4 = *(const uint32_t*)(ptr8 + base);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+        uint32_t h0, h1;
+        const uint16_t lo = (uint16_t)(u4 & 0xFFFFu), hi = (uint16_t)(u4 >> 16);
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h0) : "h"(lo));
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h1) : "h"(hi));
+        const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&h0));
+        const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&h1));
+        out0 = ink_pack_bf16x2(f0.x * sc, f0.y * sc);
+        out1 = ink_pack_bf16x2(f1.x * sc, f1.y * sc);
+#else
+        const float2 f0 = e4m3x2_to_f32x2((uint16_t)(u4 & 0xFFFFu));
+        const float2 f1 = e4m3x2_to_f32x2((uint16_t)(u4 >> 16));
+        out0 = ink_pack_bf16x2(f0.x * sc, f0.y * sc);
+        out1 = ink_pack_bf16x2(f1.x * sc, f1.y * sc);
+#endif
+    } else {
+        const float4 v = ink_kv_load4_half<LOAD_V>(kv, sl, p_idx, kh, lane);
+        out0 = ink_pack_bf16x2(v.x, v.y);
+        out1 = ink_pack_bf16x2(v.z, v.w);
+    }
+}
+
+template <int KV_FMT, bool HAS_HOST>
+__global__ void __launch_bounds__(192, 2) k_ink_fa2_gqa_prefill(
+    const float* __restrict__ q,          // [M, 24, 128]
+    const float* __restrict__ r_in,       // [M, 24, 16]
+    const float* __restrict__ rel_proj,   // [16, 1024]
+    const float* __restrict__ sinks,      // [M, 24]
+    const float* __restrict__ gate_attn,  // [M, 24, 128] (nullable)
+    InkKvVisitDesc kv,
+    int slot0,
+    int p0,
+    float* __restrict__ out,              // [M, 24, 128]
+    int M) {
+    constexpr int BR = 32;
+    constexpr int BC = 32;
+    constexpr float kLog2E = 1.4426950408889634f;
+    constexpr float kScaleLog2 = 0.08838834764831845f * kLog2E;
+
+    const int q_blk = blockIdx.x * BR;
+    const int kh    = blockIdx.y;  // 0..7
+    if (q_blk >= M || kh >= kInkKVHeads) return;
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;     // 0..5 (3 GQA heads x 2 Q-tiles of 16)
+    const int lane = tid & 31;     // 0..31
+    const int g    = lane >> 2;    // 0..7
+    const int t    = lane & 3;     // 0..3
+
+    const int h      = 3 * kh + (warp >> 1);
+    const int m_base = q_blk + (warp & 1) * 16;
+    const int m0     = m_base + g;
+    const int m1     = m_base + g + 8;
+    const int qp0    = p0 + m0;
+    const int qp1    = p0 + m1;
+
+    // Static SMEM = 24,576 + 8,192 + 8,192 + 3,072 + 2,048 = 46,080 B (45 KB <= 48 KB -> 2 CTAs/SM!)
+    __shared__ alignas(16) uint16_t s_Q[6][16][128];
+    __shared__ alignas(16) uint16_t s_K[BC][128];
+    __shared__ alignas(16) uint16_t s_V[BC][128];
+    __shared__ alignas(16) __half   s_R[6][16][16];
+    __shared__ alignas(16) __half   s_RP[64][16];
+
+    const int kv_col8  = lane >> 1;
+    const int kv_half4 = (lane & 1) * 4;
+
+    // 1. Load Q [16, 128] per warp into XOR-swizzled s_Q, pre-scaled by (1/sqrt(128)) * log2(e) in BF16!
+    for (int row = 0; row < 16; ++row) {
+        const int mq = m_base + row;
+        uint32_t* dst32 = reinterpret_cast<uint32_t*>(&s_Q[warp][row][ink_fa2_swz(row, kv_col8) + kv_half4]);
+        if (mq < M) {
+            const float4 qv = *reinterpret_cast<const float4*>(q + ((size_t)mq * kInkHeads + h) * kInkHeadDim + lane * 4);
+            dst32[0] = ink_pack_bf16x2(qv.x * kScaleLog2, qv.y * kScaleLog2);
+            dst32[1] = ink_pack_bf16x2(qv.z * kScaleLog2, qv.w * kScaleLog2);
+        } else {
+            dst32[0] = 0u;
+            dst32[1] = 0u;
+        }
+    }
+    // 1b. Load r [16, 16] per warp into s_R, pre-scaled by log2(e) in FP16!
+    {
+        const int r_row = lane >> 1;
+        const int r_hi  = (lane & 1) * 8;
+        const int mq    = m_base + r_row;
+        __half2* dr = reinterpret_cast<__half2*>(&s_R[warp][r_row][r_hi]);
+        if (mq < M) {
+            const float4* rp = reinterpret_cast<const float4*>(r_in + ((size_t)mq * kInkHeads + h) * kInkDRel + r_hi);
+            const float4 v0 = rp[0], v1 = rp[1];
+            dr[0] = __floats2half2_rn(v0.x * kLog2E, v0.y * kLog2E);
+            dr[1] = __floats2half2_rn(v0.z * kLog2E, v0.w * kLog2E);
+            dr[2] = __floats2half2_rn(v1.x * kLog2E, v1.y * kLog2E);
+            dr[3] = __floats2half2_rn(v1.z * kLog2E, v1.w * kLog2E);
+        } else {
+            const __half2 z = __float2half2_rn(0.0f);
+            dr[0] = z; dr[1] = z; dr[2] = z; dr[3] = z;
+        }
+    }
+    __syncthreads();
+
+    const int ldm_row = lane & 15;
+    const int ldm_c8  = (lane >> 4) & 1;
+
+    // 2. Initialize online softmax state (in log2 domain) with per-query attention sink!
+    float m_row0 = (m0 < M) ? (sinks[(size_t)m0 * kInkHeads + h] * kLog2E) : -1e30f;
+    float m_row1 = (m1 < M) ? (sinks[(size_t)m1 * kInkHeads + h] * kLog2E) : -1e30f;
+    float l_row0 = 1.0f;
+    float l_row1 = 1.0f;
+    float O[16][4];
+#pragma unroll
+    for (int db = 0; db < 16; ++db) {
+        O[db][0] = 0.0f; O[db][1] = 0.0f; O[db][2] = 0.0f; O[db][3] = 0.0f;
+    }
+
+    const int qp_min = p0 + q_blk;
+    const int qp_max = p0 + min(M, q_blk + BR) - 1;
+    const int k_beg  = kv.is_swa ? max(0, qp_min - kInkSwaWin + 1) : 0;
+    const int k_end  = qp_max + 1;
+
+    int kt = k_beg;
+
+    // 3A. Phase 1: Far Global interior tiles (dist >= 1024 -> rel_bias == 0.0f, ZERO rel_proj loads, ZERO masking!)
+    if (!kv.is_swa) {
+        const int k_far_end = qp_min - kInkRelExtent;
+        for (; kt + BC <= k_far_end; kt += BC) {
+            for (int ki = warp; ki < BC; ki += 6) {
+                const int sc = ink_fa2_swz(ki, kv_col8) + kv_half4;
+                uint32_t* dk = reinterpret_cast<uint32_t*>(&s_K[ki][sc]);
+                uint32_t* dv = reinterpret_cast<uint32_t*>(&s_V[ki][sc]);
+                const int p_idx = min(kt + ki, kv.cap_pos - 1);
+                ink_fa2_load_kv4_bf16x2<KV_FMT, HAS_HOST, false>(kv, slot0, p_idx, kh, lane, dk[0], dk[1]);
+                ink_fa2_load_kv4_bf16x2<KV_FMT, HAS_HOST, true>(kv, slot0, p_idx, kh, lane, dv[0], dv[1]);
+            }
+            __syncthreads();
+
+            float S[4][4] = {};
+#pragma unroll
+            for (int kd8 = 0; kd8 < 16; kd8 += 2) {
+                uint32_t a0, a1, a2, a3;
+                ink_fa2_ldm4(a0, a1, a2, a3, &s_Q[warp][ldm_row][ink_fa2_swz(ldm_row, kd8 + ldm_c8)]);
+#pragma unroll
+                for (int nb_pair = 0; nb_pair < 2; ++nb_pair) {
+                    const int k_row = nb_pair * 16 + ldm_row;
+                    uint32_t b0, b1, b2, b3;
+                    ink_fa2_ldm4(b0, b1, b2, b3, &s_K[k_row][ink_fa2_swz(k_row, kd8 + ldm_c8)]);
+                    ink_mma_m16n8k16_bf16(S[2*nb_pair][0], S[2*nb_pair][1], S[2*nb_pair][2], S[2*nb_pair][3], a0, a1, a2, a3, b0, b2);
+                    ink_mma_m16n8k16_bf16(S[2*nb_pair+1][0], S[2*nb_pair+1][1], S[2*nb_pair+1][2], S[2*nb_pair+1][3], a0, a1, a2, a3, b1, b3);
+                }
+            }
+
+            float mx0 = fmaxf(fmaxf(S[0][0], S[0][1]), fmaxf(S[1][0], S[1][1]));
+            mx0 = fmaxf(mx0, fmaxf(fmaxf(S[2][0], S[2][1]), fmaxf(S[3][0], S[3][1])));
+            float mx1 = fmaxf(fmaxf(S[0][2], S[0][3]), fmaxf(S[1][2], S[1][3]));
+            mx1 = fmaxf(mx1, fmaxf(fmaxf(S[2][2], S[2][3]), fmaxf(S[3][2], S[3][3])));
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xFFFFFFFFu, mx0, 1));
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xFFFFFFFFu, mx0, 2));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xFFFFFFFFu, mx1, 1));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xFFFFFFFFu, mx1, 2));
+
+            const float m_new0 = fmaxf(m_row0, mx0);
+            const float m_new1 = fmaxf(m_row1, mx1);
+            if (__any_sync(0xFFFFFFFFu, (m_new0 > m_row0) || (m_new1 > m_row1))) {
+                const float al0 = ink_fa2_ex2(m_row0 - m_new0);
+                const float al1 = ink_fa2_ex2(m_row1 - m_new1);
+                m_row0 = m_new0; m_row1 = m_new1;
+                l_row0 *= al0; l_row1 *= al1;
+#pragma unroll
+                for (int db = 0; db < 16; ++db) {
+                    O[db][0] *= al0; O[db][1] *= al0;
+                    O[db][2] *= al1; O[db][3] *= al1;
+                }
+            }
+
+            uint32_t P_bf16[2][4];
+            float tl0 = 0.0f, tl1 = 0.0f;
+#pragma unroll
+            for (int kb = 0; kb < 2; ++kb) {
+                const int n0 = 2 * kb, n1 = 2 * kb + 1;
+                const float p00 = ink_fa2_ex2(S[n0][0] - m_new0), p01 = ink_fa2_ex2(S[n0][1] - m_new0);
+                const float p02 = ink_fa2_ex2(S[n0][2] - m_new1), p03 = ink_fa2_ex2(S[n0][3] - m_new1);
+                const float p10 = ink_fa2_ex2(S[n1][0] - m_new0), p11 = ink_fa2_ex2(S[n1][1] - m_new0);
+                const float p12 = ink_fa2_ex2(S[n1][2] - m_new1), p13 = ink_fa2_ex2(S[n1][3] - m_new1);
+                tl0 += (p00 + p01) + (p10 + p11);
+                tl1 += (p02 + p03) + (p12 + p13);
+                P_bf16[kb][0] = ink_pack_bf16x2(p00, p01);
+                P_bf16[kb][1] = ink_pack_bf16x2(p02, p03);
+                P_bf16[kb][2] = ink_pack_bf16x2(p10, p11);
+                P_bf16[kb][3] = ink_pack_bf16x2(p12, p13);
+            }
+            tl0 += __shfl_xor_sync(0xFFFFFFFFu, tl0, 1); tl0 += __shfl_xor_sync(0xFFFFFFFFu, tl0, 2);
+            tl1 += __shfl_xor_sync(0xFFFFFFFFu, tl1, 1); tl1 += __shfl_xor_sync(0xFFFFFFFFu, tl1, 2);
+            l_row0 += tl0; l_row1 += tl1;
+
+#pragma unroll
+            for (int kb = 0; kb < 2; ++kb) {
+                const int v_row = kb * 16 + ldm_row;
+#pragma unroll
+                for (int db_pair = 0; db_pair < 8; ++db_pair) {
+                    uint32_t b0, b1, b2, b3;
+                    ink_fa2_ldm4_t(b0, b1, b2, b3, &s_V[v_row][ink_fa2_swz(v_row, db_pair * 2 + ldm_c8)]);
+                    ink_mma_m16n8k16_bf16(O[2*db_pair][0], O[2*db_pair][1], O[2*db_pair][2], O[2*db_pair][3],
+                                          P_bf16[kb][0], P_bf16[kb][1], P_bf16[kb][2], P_bf16[kb][3], b0, b1);
+                    ink_mma_m16n8k16_bf16(O[2*db_pair+1][0], O[2*db_pair+1][1], O[2*db_pair+1][2], O[2*db_pair+1][3],
+                                          P_bf16[kb][0], P_bf16[kb][1], P_bf16[kb][2], P_bf16[kb][3], b2, b3);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // 3B. Phase 2: Near (RelPos active inline via s_R @ s_RP) & Boundary (causal / SWA-1024 edge) tiles
+    for (; kt < k_end; kt += BC) {
+        const int kc   = min(BC, k_end - kt);
+        const int d_lo = max(0, qp_min - (kt + BC - 1));
+        for (int ki = warp; ki < BC; ki += 6) {
+            const int sc = ink_fa2_swz(ki, kv_col8) + kv_half4;
+            uint32_t* dk = reinterpret_cast<uint32_t*>(&s_K[ki][sc]);
+            uint32_t* dv = reinterpret_cast<uint32_t*>(&s_V[ki][sc]);
+            if (ki < kc) {
+                const int kp = kt + ki;
+                const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : min(max(kp, 0), kv.cap_pos - 1);
+                ink_fa2_load_kv4_bf16x2<KV_FMT, HAS_HOST, false>(kv, slot0, p_idx, kh, lane, dk[0], dk[1]);
+                ink_fa2_load_kv4_bf16x2<KV_FMT, HAS_HOST, true>(kv, slot0, p_idx, kh, lane, dv[0], dv[1]);
+            } else {
+                dk[0] = 0u; dk[1] = 0u;
+                dv[0] = 0u; dv[1] = 0u;
+            }
+        }
+        for (int idx = tid; idx < 1024; idx += 192) {
+            const int c    = idx >> 6;
+            const int di   = idx & 63;
+            const int dist = d_lo + di;
+            s_RP[di][c] = (dist < kInkRelExtent) ? __float2half_rn(rel_proj[(size_t)c * kInkRelExtent + dist]) : __float2half_rn(0.0f);
+        }
+        __syncthreads();
+
+        float S[4][4] = {};
+#pragma unroll
+        for (int kd8 = 0; kd8 < 16; kd8 += 2) {
+            uint32_t a0, a1, a2, a3;
+            ink_fa2_ldm4(a0, a1, a2, a3, &s_Q[warp][ldm_row][ink_fa2_swz(ldm_row, kd8 + ldm_c8)]);
+#pragma unroll
+            for (int nb_pair = 0; nb_pair < 2; ++nb_pair) {
+                const int k_row = nb_pair * 16 + ldm_row;
+                uint32_t b0, b1, b2, b3;
+                ink_fa2_ldm4(b0, b1, b2, b3, &s_K[k_row][ink_fa2_swz(k_row, kd8 + ldm_c8)]);
+                ink_mma_m16n8k16_bf16(S[2*nb_pair][0], S[2*nb_pair][1], S[2*nb_pair][2], S[2*nb_pair][3], a0, a1, a2, a3, b0, b2);
+                ink_mma_m16n8k16_bf16(S[2*nb_pair+1][0], S[2*nb_pair+1][1], S[2*nb_pair+1][2], S[2*nb_pair+1][3], a0, a1, a2, a3, b1, b3);
+            }
+        }
+
+        __half2 r0[8], r1[8];
+        *reinterpret_cast<uint4*>(&r0[0]) = *reinterpret_cast<const uint4*>(&s_R[warp][g][0]);
+        *reinterpret_cast<uint4*>(&r0[4]) = *reinterpret_cast<const uint4*>(&s_R[warp][g][8]);
+        *reinterpret_cast<uint4*>(&r1[0]) = *reinterpret_cast<const uint4*>(&s_R[warp][g + 8][0]);
+        *reinterpret_cast<uint4*>(&r1[4]) = *reinterpret_cast<const uint4*>(&s_R[warp][g + 8][8]);
+
+        const bool full_valid = (kt + BC <= qp_min + 1) && (!kv.is_swa || kt >= qp_max - kInkSwaWin + 1);
+        if (full_valid) {
+#pragma unroll
+            for (int nb = 0; nb < 4; ++nb) {
+                const int kpa = kt + nb * 8 + 2 * t, kpb = kpa + 1;
+                const int da0 = qp0 - kpa - d_lo, db0 = qp0 - kpb - d_lo;
+                const int da1 = qp1 - kpa - d_lo, db1 = qp1 - kpb - d_lo;
+                S[nb][0] += ink_fa2_dot16_h2(r0, reinterpret_cast<const __half2*>(s_RP[da0]));
+                S[nb][1] += ink_fa2_dot16_h2(r0, reinterpret_cast<const __half2*>(s_RP[db0]));
+                S[nb][2] += ink_fa2_dot16_h2(r1, reinterpret_cast<const __half2*>(s_RP[da1]));
+                S[nb][3] += ink_fa2_dot16_h2(r1, reinterpret_cast<const __half2*>(s_RP[db1]));
+            }
+        } else {
+#pragma unroll
+            for (int nb = 0; nb < 4; ++nb) {
+                const int kpa = kt + nb * 8 + 2 * t, kpb = kpa + 1;
+                const int da0 = qp0 - kpa, db0 = qp0 - kpb;
+                const int da1 = qp1 - kpa, db1 = qp1 - kpb;
+                if (m0 < M && kpa < k_end && da0 >= 0 && (!kv.is_swa || da0 < kInkSwaWin)) {
+                    if (da0 < kInkRelExtent) S[nb][0] += ink_fa2_dot16_h2(r0, reinterpret_cast<const __half2*>(s_RP[da0 - d_lo]));
+                } else S[nb][0] = -1e30f;
+                if (m0 < M && kpb < k_end && db0 >= 0 && (!kv.is_swa || db0 < kInkSwaWin)) {
+                    if (db0 < kInkRelExtent) S[nb][1] += ink_fa2_dot16_h2(r0, reinterpret_cast<const __half2*>(s_RP[db0 - d_lo]));
+                } else S[nb][1] = -1e30f;
+                if (m1 < M && kpa < k_end && da1 >= 0 && (!kv.is_swa || da1 < kInkSwaWin)) {
+                    if (da1 < kInkRelExtent) S[nb][2] += ink_fa2_dot16_h2(r1, reinterpret_cast<const __half2*>(s_RP[da1 - d_lo]));
+                } else S[nb][2] = -1e30f;
+                if (m1 < M && kpb < k_end && db1 >= 0 && (!kv.is_swa || db1 < kInkSwaWin)) {
+                    if (db1 < kInkRelExtent) S[nb][3] += ink_fa2_dot16_h2(r1, reinterpret_cast<const __half2*>(s_RP[db1 - d_lo]));
+                } else S[nb][3] = -1e30f;
+            }
+        }
+
+        float mx0 = fmaxf(fmaxf(S[0][0], S[0][1]), fmaxf(S[1][0], S[1][1]));
+        mx0 = fmaxf(mx0, fmaxf(fmaxf(S[2][0], S[2][1]), fmaxf(S[3][0], S[3][1])));
+        float mx1 = fmaxf(fmaxf(S[0][2], S[0][3]), fmaxf(S[1][2], S[1][3]));
+        mx1 = fmaxf(mx1, fmaxf(fmaxf(S[2][2], S[2][3]), fmaxf(S[3][2], S[3][3])));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xFFFFFFFFu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xFFFFFFFFu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xFFFFFFFFu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xFFFFFFFFu, mx1, 2));
+
+        const float m_new0 = fmaxf(m_row0, mx0);
+        const float m_new1 = fmaxf(m_row1, mx1);
+        if (__any_sync(0xFFFFFFFFu, (m_new0 > m_row0) || (m_new1 > m_row1))) {
+            const float al0 = ink_fa2_ex2(m_row0 - m_new0);
+            const float al1 = ink_fa2_ex2(m_row1 - m_new1);
+            m_row0 = m_new0; m_row1 = m_new1;
+            l_row0 *= al0; l_row1 *= al1;
+#pragma unroll
+            for (int db = 0; db < 16; ++db) {
+                O[db][0] *= al0; O[db][1] *= al0;
+                O[db][2] *= al1; O[db][3] *= al1;
+            }
+        }
+
+        uint32_t P_bf16[2][4];
+        float tl0 = 0.0f, tl1 = 0.0f;
+#pragma unroll
+        for (int kb = 0; kb < 2; ++kb) {
+            const int n0 = 2 * kb, n1 = 2 * kb + 1;
+            const float p00 = ink_fa2_ex2(S[n0][0] - m_new0), p01 = ink_fa2_ex2(S[n0][1] - m_new0);
+            const float p02 = ink_fa2_ex2(S[n0][2] - m_new1), p03 = ink_fa2_ex2(S[n0][3] - m_new1);
+            const float p10 = ink_fa2_ex2(S[n1][0] - m_new0), p11 = ink_fa2_ex2(S[n1][1] - m_new0);
+            const float p12 = ink_fa2_ex2(S[n1][2] - m_new1), p13 = ink_fa2_ex2(S[n1][3] - m_new1);
+            tl0 += (p00 + p01) + (p10 + p11);
+            tl1 += (p02 + p03) + (p12 + p13);
+            P_bf16[kb][0] = ink_pack_bf16x2(p00, p01);
+            P_bf16[kb][1] = ink_pack_bf16x2(p02, p03);
+            P_bf16[kb][2] = ink_pack_bf16x2(p10, p11);
+            P_bf16[kb][3] = ink_pack_bf16x2(p12, p13);
+        }
+        tl0 += __shfl_xor_sync(0xFFFFFFFFu, tl0, 1); tl0 += __shfl_xor_sync(0xFFFFFFFFu, tl0, 2);
+        tl1 += __shfl_xor_sync(0xFFFFFFFFu, tl1, 1); tl1 += __shfl_xor_sync(0xFFFFFFFFu, tl1, 2);
+        l_row0 += tl0; l_row1 += tl1;
+
+#pragma unroll
+        for (int kb = 0; kb < 2; ++kb) {
+            const int v_row = kb * 16 + ldm_row;
+#pragma unroll
+            for (int db_pair = 0; db_pair < 8; ++db_pair) {
+                uint32_t b0, b1, b2, b3;
+                ink_fa2_ldm4_t(b0, b1, b2, b3, &s_V[v_row][ink_fa2_swz(v_row, db_pair * 2 + ldm_c8)]);
+                ink_mma_m16n8k16_bf16(O[2*db_pair][0], O[2*db_pair][1], O[2*db_pair][2], O[2*db_pair][3],
+                                      P_bf16[kb][0], P_bf16[kb][1], P_bf16[kb][2], P_bf16[kb][3], b0, b1);
+                ink_mma_m16n8k16_bf16(O[2*db_pair+1][0], O[2*db_pair+1][1], O[2*db_pair+1][2], O[2*db_pair+1][3],
+                                      P_bf16[kb][0], P_bf16[kb][1], P_bf16[kb][2], P_bf16[kb][3], b2, b3);
+            }
+        }
+        __syncthreads();
+    }
+
+    // 4. Normalize + fused * sigmoid(gate_attn) + write out [M, 24, 128]!
+    const float inv_l0 = 1.0f / l_row0;
+    const float inv_l1 = 1.0f / l_row1;
+    if (m0 < M) {
+        const size_t ob0 = ((size_t)m0 * kInkHeads + h) * kInkHeadDim;
+#pragma unroll
+        for (int db = 0; db < 16; ++db) {
+            const int d0 = db * 8 + 2 * t;
+            float v0 = O[db][0] * inv_l0;
+            float v1 = O[db][1] * inv_l0;
+            if (gate_attn) {
+                v0 *= 1.0f / (1.0f + __expf(-gate_attn[ob0 + d0 + 0]));
+                v1 *= 1.0f / (1.0f + __expf(-gate_attn[ob0 + d0 + 1]));
+            }
+            out[ob0 + d0 + 0] = v0;
+            out[ob0 + d0 + 1] = v1;
+        }
+    }
+    if (m1 < M) {
+        const size_t ob1 = ((size_t)m1 * kInkHeads + h) * kInkHeadDim;
+#pragma unroll
+        for (int db = 0; db < 16; ++db) {
+            const int d0 = db * 8 + 2 * t;
+            float v0 = O[db][2] * inv_l1;
+            float v1 = O[db][3] * inv_l1;
+            if (gate_attn) {
+                v0 *= 1.0f / (1.0f + __expf(-gate_attn[ob1 + d0 + 0]));
+                v1 *= 1.0f / (1.0f + __expf(-gate_attn[ob1 + d0 + 1]));
+            }
+            out[ob1 + d0 + 0] = v0;
+            out[ob1 + d0 + 1] = v1;
+        }
+    }
+}
+
+inline void launch_ink_fa2_gqa_prefill(
+    cudaStream_t st,
+    const float* q, const float* r_in, const float* rel_proj,
+    const float* sinks, const float* gate_attn,
+    const InkKvVisitDesc& kv, int slot0, int p0, float* out, int M) {
+    dim3 gfa((M + 31) / 32, kInkKVHeads);
+    const bool has_host = (!kv.is_swa && kv.host_cap > 0);
+    if (kv.kv_fmt == 1) {
+        if (has_host) k_ink_fa2_gqa_prefill<1, true><<<gfa, 192, 0, st>>>(q, r_in, rel_proj, sinks, gate_attn, kv, slot0, p0, out, M);
+        else          k_ink_fa2_gqa_prefill<1, false><<<gfa, 192, 0, st>>>(q, r_in, rel_proj, sinks, gate_attn, kv, slot0, p0, out, M);
+    } else {
+        if (has_host) k_ink_fa2_gqa_prefill<0, true><<<gfa, 192, 0, st>>>(q, r_in, rel_proj, sinks, gate_attn, kv, slot0, p0, out, M);
+        else          k_ink_fa2_gqa_prefill<0, false><<<gfa, 192, 0, st>>>(q, r_in, rel_proj, sinks, gate_attn, kv, slot0, p0, out, M);
     }
 }
 

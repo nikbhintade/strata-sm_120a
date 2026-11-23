@@ -1997,7 +1997,9 @@ struct InkCudaRunner {
             const size_t wddm_fl = InkCudaModel::wddm_safety_floor(vtot);
             const size_t base_ws_res = (max_slots >= 8) ? (1280ull << 20)
                                      : (vtot <= (18ull << 30) && max_slots == 1)
-                                         ? ((max_batch <= 256) ? (448ull << 20) : (560ull << 20))
+                                         ? ((m.sm_cc >= 80)
+                                             ? ((max_batch <= 256) ? (288ull << 20) : (400ull << 20))
+                                             : ((max_batch <= 256) ? (448ull << 20) : (560ull << 20)))
                                          : (768ull << 20);
             const size_t dspark_ws_res = m.man.has_dspark
                                        ? ((vtot <= (18ull << 30) && !m.unembed_screen.ready) ? (128ull << 20) : (256ull << 20))
@@ -2140,7 +2142,8 @@ struct InkCudaRunner {
         d_v_dyn     = dalloc<float>(MB * kInkKVHeads * 4);
         d_sinks     = dalloc<float>(MB * kInkHeads);
         d_gate_attn = dalloc<float>(MB * kInkQDim);
-        d_rel_table = dalloc<float>(MB * kInkHeads * (kInkRelExtent + 1));
+        const size_t rel_rows = (m.sm_cc >= 80 && !m.ls_active) ? (size_t)std::max(max_slots, tree_cap) : MB;
+        d_rel_table = dalloc<float>(rel_rows * kInkHeads * (kInkRelExtent + 1));
         d_attn_out  = dalloc<float>(MB * kInkQDim);
         d_wo_raw    = dalloc<float>(MB * kInkHidden);
         d_wo_conv   = dalloc<float>(MB * kInkHidden);
@@ -2217,8 +2220,9 @@ struct InkCudaRunner {
         h_meta_pin  = halloc_pinned<int32_t>(64ull * meta_ring_stride);
 
         moe_ws.alloc(max_batch);
-        // Pre-allocate O(1)-VRAM Tensor Core prefill attention workspace (~114 MiB fixed forever!)
-        if (m.sm_cc >= 60 && max_slots <= 4 && max_batch >= 128) {
+        // Pre-allocate O(1)-VRAM Tensor Core prefill attention workspace (~114 MiB) only for pre-Ampere GPUs
+        // (sm_80+ uses zero-VRAM fused FlashAttention-2 GQA-3 kernel k_ink_fa2_gqa_prefill!)
+        if (m.sm_cc >= 60 && m.sm_cc < 80 && max_slots <= 4 && max_batch >= 128) {
             size_t vf = 0, vt = 0;
             INK_CK(ink_cuda_mem_info(&vf, &vt, m.primary_gpu));
             const size_t pf_min_vf = (vt <= (18ull << 30)) ? (208ull << 20) : (320ull << 20);
@@ -3227,9 +3231,15 @@ struct InkCudaRunner {
         prof_mark_end(2); prof_mark_start();
         {
             const int cur_cc = m.ls_active ? m.stage_cc[cur_stage] : m.sm_cc;
+            const float* rel_proj = (const float*)m.trunk_ptr_stage(cur_stage, p + ".attn.rel_logits_proj.proj");
             dim3 gr(kInkHeads, M);
-            k_ink_rel_table<<<dim3(8, M), 128, 0, st>>>(d_r, (const float*)m.trunk_ptr_stage(cur_stage, p + ".attn.rel_logits_proj.proj"), d_rel_table, M);
-            if (M <= 16 || mode == 2) {
+            if (mode == 0 && M > 16 && cur_cc >= 80) {
+                // Zero-VRAM Fused FlashAttention-2 GQA-3 Prefill with Inline RelPos (skips k_ink_rel_table & frees 161 MiB!)
+                launch_ink_fa2_gqa_prefill(
+                    st, d_q, d_r, rel_proj, d_sinks, d_gate_attn,
+                    kv_desc[visit], slot0, p0_val, d_attn_out, M);
+            } else if (M <= 16 || mode == 2) {
+                k_ink_rel_table<<<dim3(8, M), 128, 0, st>>>(d_r, rel_proj, d_rel_table, M);
                 const int n_sp = (M == 1) ? (is_swa ? 16 : kInkAttnMaxSplits) : kInkAttnSplits;
                 dim3 gsp(kInkKVHeads, n_sp, M);
                 k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
@@ -3240,6 +3250,7 @@ struct InkCudaRunner {
                     p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp);
                 k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M, n_sp);
             } else if (mode == 0 && M >= 128 && (cur_cc >= 70 || cur_cc == 60) && ensure_pf_attn(kInkPfKvTile)) {
+                k_ink_rel_table<<<dim3(8, M), 128, 0, st>>>(d_r, rel_proj, d_rel_table, M);
                 // O(1)-VRAM KV-Tiled Online-Softmax Tensor Core Prefill Attention (fixed <= ~114 MiB even at 256K+ ctx!)
                 const bool use_fp16_pf = (cur_cc < 80);
                 const cudaDataType_t pf_dt = use_fp16_pf ? CUDA_R_16F : CUDA_R_16BF;
@@ -3325,6 +3336,7 @@ struct InkCudaRunner {
                     }
                 }
             } else {
+                k_ink_rel_table<<<dim3(8, M), 128, 0, st>>>(d_r, rel_proj, d_rel_table, M);
                 dim3 g3(kInkKVHeads, M);
                 k_ink_flash_gqa_gqa3<<<g3, 128, 0, st>>>(
                     d_q, d_rel_table, d_sinks, d_gate_attn,
