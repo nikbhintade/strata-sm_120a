@@ -239,6 +239,177 @@ __global__ void __launch_bounds__(128) k_dspark_block_attn(
     }
 }
 
+// Shared-KV Split-K Global Block-8 Attention for DSpark (eliminates 24x redundant global KV reads at 32K..128K!):
+//   - Grid: (8 KV heads, kDsparkGlobSplits), Block: 256 threads (8 warps = 1 warp per draft token b in 0..7)
+//   - All 8 warps cooperatively stage TK=16 KV tokens into SMEM (16 KB) and reuse them across all 8 tokens x 3 GQA heads = 24x!
+//   - Cuts 128K FP8 global KV traffic from 6.34 GB -> 264 MiB (100% CUDA-Graph capturable!).
+constexpr int kDsparkGlobSplits = 16;
+
+__global__ void __launch_bounds__(256, 2) k_dspark_block_attn_glob_splitk(
+    const float* __restrict__ q,          // [B=8, 24, 128]
+    const float* __restrict__ kd,         // [B=8, 8, 128]
+    const float* __restrict__ vd,         // [B=8, 8, 128]
+    const __half* __restrict__ ctx_k,     // [ctx_cap, 8, 128]
+    const __half* __restrict__ ctx_v,     // [ctx_cap, 8, 128]
+    const uint8_t* __restrict__ ctx_k_f8, // [ctx_cap, 8, 128] (non-null => FP8 E4M3)
+    const uint8_t* __restrict__ ctx_v_f8, // [ctx_cap, 8, 128]
+    const float* __restrict__ ctx_k_sc,   // [ctx_cap, 8]
+    const float* __restrict__ ctx_v_sc,   // [ctx_cap, 8]
+    const int32_t* __restrict__ apos_ptr, // [1]
+    int ctx_cap,
+    int n_splits,
+    float* __restrict__ part_m,           // [8, 24, n_splits]
+    float* __restrict__ part_l,           // [8, 24, n_splits]
+    float* __restrict__ part_o) {         // [8, 24, n_splits, 128]
+    constexpr int B  = kInkDsparkBlock;   // 8
+    constexpr int TK = 16;
+    const int kh = blockIdx.x;            // 0..7
+    const int sp = blockIdx.y;            // 0..n_splits-1
+    if (kh >= kInkKVHeads || sp >= n_splits) return;
+
+    const int tid  = threadIdx.x;
+    const int b    = tid >> 5;            // warp 0..7 = draft token b
+    const int lane = tid & 31;            // 0..31 -> dims 4*lane .. 4*lane+3
+    const int h0   = 3 * kh;
+    const float scale = 0.08838834764831845f;
+
+    const float4 qv0 = *(const float4*)(q + ((size_t)b * kInkHeads + h0 + 0) * kInkHeadDim + lane * 4);
+    const float4 qv1 = *(const float4*)(q + ((size_t)b * kInkHeads + h0 + 1) * kInkHeadDim + lane * 4);
+    const float4 qv2 = *(const float4*)(q + ((size_t)b * kInkHeads + h0 + 2) * kInkHeadDim + lane * 4);
+
+    float mw[3] = {-1e30f, -1e30f, -1e30f};
+    float lw[3] = {0.0f, 0.0f, 0.0f};
+    float a[3][4] = {};
+
+    __shared__ float4 s_K[TK][32];
+    __shared__ float4 s_V[TK][32];
+
+    auto attend3 = [&](float4 kv4, float4 vv4) {
+        const float d0 = warp_sum(qv0.x * kv4.x + qv0.y * kv4.y + qv0.z * kv4.z + qv0.w * kv4.w) * scale;
+        const float d1 = warp_sum(qv1.x * kv4.x + qv1.y * kv4.y + qv1.z * kv4.z + qv1.w * kv4.w) * scale;
+        const float d2 = warp_sum(qv2.x * kv4.x + qv2.y * kv4.y + qv2.z * kv4.z + qv2.w * kv4.w) * scale;
+        const float ds[3] = {d0, d1, d2};
+#pragma unroll
+        for (int r = 0; r < 3; ++r) {
+            const float mn = fmaxf(mw[r], ds[r]);
+            const float al = __expf(mw[r] - mn);
+            const float p  = __expf(ds[r] - mn);
+            lw[r] = lw[r] * al + p;
+            a[r][0] = a[r][0] * al + p * vv4.x;
+            a[r][1] = a[r][1] * al + p * vv4.y;
+            a[r][2] = a[r][2] * al + p * vv4.z;
+            a[r][3] = a[r][3] * al + p * vv4.w;
+            mw[r] = mn;
+        }
+    };
+
+    const int apos   = *apos_ptr;
+    const int c_end  = min(apos, ctx_cap);
+    const int per_sp = (c_end + n_splits - 1) / n_splits;
+    const int s_beg  = sp * per_sp;
+    const int s_end  = min(c_end, s_beg + per_sp);
+
+    for (int kt = s_beg; kt < s_end; kt += TK) {
+        const int kc = min(TK, s_end - kt);
+        for (int ti = b; ti < kc; ti += B) {
+            const int kp = kt + ti;
+            if (ctx_k_f8) {
+                const size_t hbase = (size_t)kp * kInkKVHeads + kh;
+                const size_t base  = hbase * kInkHeadDim + lane * 4;
+                const float sk = ctx_k_sc[hbase];
+                const float sv = ctx_v_sc[hbase];
+                const uint32_t k4 = *(const uint32_t*)(ctx_k_f8 + base);
+                const uint32_t v4 = *(const uint32_t*)(ctx_v_f8 + base);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+                uint32_t kh0, kh1, vh0, vh1;
+                const uint16_t klo = (uint16_t)(k4 & 0xFFFFu), khi = (uint16_t)(k4 >> 16);
+                const uint16_t vlo = (uint16_t)(v4 & 0xFFFFu), vhi = (uint16_t)(v4 >> 16);
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(kh0) : "h"(klo));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(kh1) : "h"(khi));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(vh0) : "h"(vlo));
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(vh1) : "h"(vhi));
+                const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&kh0));
+                const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&kh1));
+                const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&vh0));
+                const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&vh1));
+#else
+                const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
+                const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
+                const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
+                const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4 >> 16));
+#endif
+                s_K[ti][lane] = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
+                s_V[ti][lane] = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
+            } else {
+                const size_t base = ((size_t)kp * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
+                const uint2 k2 = *(const uint2*)(ctx_k + base);
+                const uint2 v2 = *(const uint2*)(ctx_v + base);
+                const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
+                const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
+                const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
+                const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
+                s_K[ti][lane] = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
+                s_V[ti][lane] = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
+            }
+        }
+        __syncthreads();
+        for (int ti = 0; ti < kc; ++ti) {
+            attend3(s_K[ti][lane], s_V[ti][lane]);
+        }
+        __syncthreads();
+    }
+
+    if (sp == 0) {
+        const size_t dbase = ((size_t)b * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
+        s_K[b][lane] = *(const float4*)(kd + dbase);
+        s_V[b][lane] = *(const float4*)(vd + dbase);
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < B; ++j) {
+            attend3(s_K[j][lane], s_V[j][lane]);
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < 3; ++r) {
+        const size_t idx = ((size_t)b * kInkHeads + h0 + r) * n_splits + sp;
+        if (lane == 0) {
+            part_m[idx] = mw[r];
+            part_l[idx] = lw[r];
+        }
+        *(float4*)(part_o + idx * kInkHeadDim + lane * 4) = make_float4(a[r][0], a[r][1], a[r][2], a[r][3]);
+    }
+}
+
+__global__ void __launch_bounds__(128) k_dspark_block_attn_glob_merge(
+    const float* __restrict__ part_m,     // [B=8, 24, n_splits]
+    const float* __restrict__ part_l,     // [B=8, 24, n_splits]
+    const float* __restrict__ part_o,     // [B=8, 24, n_splits, 128]
+    int n_splits,
+    float* __restrict__ out) {            // [B=8, 24, 128]
+    const int h = blockIdx.x;  // 0..23
+    const int b = blockIdx.y;  // 0..7
+    const int d = threadIdx.x; // 0..127
+    if (h >= kInkHeads || b >= kInkDsparkBlock) return;
+
+    const size_t base = ((size_t)b * kInkHeads + h) * n_splits;
+    float mg = -1e30f;
+    for (int sp = 0; sp < n_splits; ++sp) {
+        if (part_l[base + sp] > 0.0f) mg = fmaxf(mg, part_m[base + sp]);
+    }
+    float l_tot = 0.0f;
+    float acc = 0.0f;
+    for (int sp = 0; sp < n_splits; ++sp) {
+        const float ls = part_l[base + sp];
+        if (ls > 0.0f) {
+            const float w = __expf(part_m[base + sp] - mg);
+            l_tot += ls * w;
+            acc   += part_o[(base + sp) * kInkHeadDim + d] * w;
+        }
+    }
+    out[((size_t)b * kInkHeads + h) * kInkHeadDim + d] = acc / l_tot;
+}
+
 __global__ void __launch_bounds__(256) k_dspark_fill_mask(
     const float* __restrict__ mask_e,
     float* __restrict__ dst_cur,
@@ -1106,6 +1277,7 @@ struct InkDSpark {
     float *d_cur = nullptr, *d_h = nullptr, *d_q = nullptr, *d_k = nullptr, *d_v = nullptr;
     float *d_qkv_fused = nullptr, *d_gu_fused = nullptr;
     float *d_attn_out = nullptr, *d_proj = nullptr, *d_g = nullptr, *d_u = nullptr, *d_act = nullptr;
+    float *d_glob_pm = nullptr, *d_glob_pl = nullptr, *d_glob_po = nullptr;  // Split-K global block-attn partials (~1.5 MiB)
     float *d_ctx_tmp = nullptr, *d_kc_tmp = nullptr, *d_vc_tmp = nullptr, *d_kv_ctx_fused = nullptr;
     float *d_base_logits = nullptr;  // [7, V_unpadded] (slots 1..7)
     int32_t *d_cand_ids = nullptr;   // [7, K_cand]
@@ -1231,6 +1403,9 @@ struct InkDSpark {
         d_qkv_fused   = dalloc<float>(B * (kInkQDim + 2 * kInkKVDim));
         d_gu_fused    = dalloc<float>(B * (2 * kInkDsparkInter));
         d_attn_out    = dalloc<float>(B * kInkQDim);
+        d_glob_pm     = dalloc<float>((size_t)B * kInkHeads * kDsparkGlobSplits);
+        d_glob_pl     = dalloc<float>((size_t)B * kInkHeads * kDsparkGlobSplits);
+        d_glob_po     = dalloc<float>((size_t)B * kInkHeads * kDsparkGlobSplits * kInkHeadDim);
         d_proj        = dalloc<float>(B * kInkHidden);
         d_g           = dalloc<float>(B * kInkDsparkInter);
         d_u           = dalloc<float>(B * kInkDsparkInter);
@@ -1583,10 +1758,19 @@ struct InkDSpark {
                 d_q, (const float*)m.trunk_ptr(p + ".self_attn.q_norm.weight"), d_pos, m.man.c.dspark_rope_theta, B, kInkHeads);
             k_dspark_rmsnorm_rope<<<dim3(kInkKVHeads, B), 128, 0, r.st>>>(
                 d_k, (const float*)m.trunk_ptr(p + ".self_attn.k_norm.weight"), d_pos, m.man.c.dspark_rope_theta, B, kInkKVHeads);
-            k_dspark_block_attn<<<dim3(kInkHeads, B), 128, 0, r.st>>>(
-                d_q, d_k, d_v, d_ctx_k[il], d_ctx_v[il],
-                d_ctx_k_f8[il], d_ctx_v_f8[il], d_ctx_k_sc[il], d_ctx_v_sc[il], d_apos,
-                m.man.c.dspark_is_swa[il] != 0, m.man.c.dspark_swa_win, ctx_cap[il], B, d_attn_out);
+            if (m.man.c.dspark_is_swa[il] != 0) {
+                k_dspark_block_attn<<<dim3(kInkHeads, B), 128, 0, r.st>>>(
+                    d_q, d_k, d_v, d_ctx_k[il], d_ctx_v[il],
+                    d_ctx_k_f8[il], d_ctx_v_f8[il], d_ctx_k_sc[il], d_ctx_v_sc[il], d_apos,
+                    true, m.man.c.dspark_swa_win, ctx_cap[il], B, d_attn_out);
+            } else {
+                k_dspark_block_attn_glob_splitk<<<dim3(kInkKVHeads, kDsparkGlobSplits), 256, 0, r.st>>>(
+                    d_q, d_k, d_v, d_ctx_k[il], d_ctx_v[il],
+                    d_ctx_k_f8[il], d_ctx_v_f8[il], d_ctx_k_sc[il], d_ctx_v_sc[il], d_apos,
+                    ctx_cap[il], kDsparkGlobSplits, d_glob_pm, d_glob_pl, d_glob_po);
+                k_dspark_block_attn_glob_merge<<<dim3(kInkHeads, B), 128, 0, r.st>>>(
+                    d_glob_pm, d_glob_pl, d_glob_po, kDsparkGlobSplits, d_attn_out);
+            }
             dspark_linear_b8(p + ".self_attn.o_proj.weight", d_attn_out, d_proj, B, false);
             k_ink_add<<<(B * kInkHidden + 255) / 256, 256, 0, r.st>>>(d_cur, d_cur, d_proj, B * kInkHidden);
 
@@ -1898,6 +2082,7 @@ struct InkDSpark {
         }
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
         fr(d_f_rnn); fr(d_cur); fr(d_h); fr(d_q); fr(d_k); fr(d_v); fr(d_qkv_fused); fr(d_gu_fused); fr(d_attn_out);
+        fr(d_glob_pm); fr(d_glob_pl); fr(d_glob_po);
         fr(d_proj); fr(d_g); fr(d_u); fr(d_act); fr(d_ctx_tmp); fr(d_kc_tmp); fr(d_vc_tmp); fr(d_kv_ctx_fused);
         fr(d_base_logits); fr(d_cand_ids); fr(d_cand_base); fr(d_top_tmp_ids); fr(d_top_tmp_vals); fr(d_h_q8); fr(d_h_sc); fr(d_cand_scores);
         fr(d_rnn_state); fr(d_rnn_joint); fr(d_rnn_proj); fr(d_rnn_lat);
