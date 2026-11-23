@@ -102,3 +102,24 @@ target_link_libraries(strata_inkling_cuda PUBLIC
 
 target_compile_definitions(strata-inkling PRIVATE INKLING_ENABLE_CUDA=1)
 target_link_libraries(strata-inkling PRIVATE strata_inkling_cuda)
+
+# 3. Standalone CUDA benchmark & kernel profiler binary (`strata-inkling-cuda`)
+add_executable(strata-inkling-cuda
+  "${CMAKE_CURRENT_SOURCE_DIR}/ink_cuda_main.cu"
+)
+target_include_directories(strata-inkling-cuda PRIVATE ${_ink_cuda_inc})
+set_target_properties(strata-inkling-cuda PROPERTIES
+  CUDA_STANDARD 20
+  CUDA_STANDARD_REQUIRED ON
+  CUDA_ARCHITECTURES "${STRATA_INK_CUDA_ARCHS}"
+  CUDA_RUNTIME_LIBRARY Shared
+)
+target_compile_options(strata-inkling-cuda PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+)
+target_link_libraries(strata-inkling-cuda PRIVATE
+  strata_inkling_cuda_sm120
+  strata_inkling_core
+  CUDA::cudart
+  CUDA::cublas
+)

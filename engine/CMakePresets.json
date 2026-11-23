@@ -53,13 +53,27 @@
         "STRATA_PORTABLE": "ON",
         "CMAKE_HIP_ARCHITECTURES": "gfx1100;gfx1201"
       }
+    },
+    {
+      "name": "sm120a-dev",
+      "displayName": "Blackwell RTX 50-series (sm_120 / sm_120a) fast dev build",
+      "description": "Single-arch Blackwell CUDA build for strata-inkling and strata-inkling-cuda.",
+      "binaryDir": "${sourceDir}/build-inkling",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STRATA_ENABLE_CUDA": "ON",
+        "STRATA_BUILD_TESTS": "OFF",
+        "STRATA_BUILD_INKLING2": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "120"
+      }
     }
   ],
   "buildPresets": [
     { "name": "cpu-check", "configurePreset": "cpu-check", "jobs": 0 },
     { "name": "cpu-check-native", "configurePreset": "cpu-check-native", "jobs": 0 },
     { "name": "cuda-compile", "configurePreset": "cuda-compile", "targets": ["strata"], "jobs": 0 },
-    { "name": "hip-compile", "configurePreset": "hip-compile", "targets": ["strata"], "jobs": 0 }
+    { "name": "hip-compile", "configurePreset": "hip-compile", "targets": ["strata"], "jobs": 0 },
+    { "name": "sm120a-dev", "configurePreset": "sm120a-dev", "targets": ["strata-inkling", "strata-inkling-cuda"], "jobs": 0 }
   ],
   "testPresets": [
     {
