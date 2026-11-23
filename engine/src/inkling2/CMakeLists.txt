@@ -149,6 +149,15 @@ if(COMMAND strata_utf8_manifest)
   strata_utf8_manifest(strata-inkling)
 endif()
 
+# Standalone multithreaded .strata v1.1 SQ-15 -> SQ-12 (16 GB 128K full-VRAM) repacker
+add_executable(strata-repack-sq12
+  ${CMAKE_CURRENT_SOURCE_DIR}/ink_repack_sq12.cpp
+)
+target_link_libraries(strata-repack-sq12 PRIVATE strata_inkling_core)
+if(NOT MSVC)
+  target_compile_options(strata-repack-sq12 PRIVATE -O3)
+endif()
+
 # Optional GPU backend plug-ins (automatically wired when backend lane lands its subfolder!)
 if(STRATA_ENABLE_CUDA)
   if(MSVC AND NOT DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
