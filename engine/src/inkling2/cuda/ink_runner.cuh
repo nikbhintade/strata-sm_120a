@@ -664,11 +664,14 @@ struct InkCudaModel {
         }
         convert_controllers_to_bf16();
 
-        // 4. Build exact 2-stage Cauchy-Schwarz screening index for BF16 or S6_K unembed (SQ-20, SQ-15, SQ-10)!
+        // 4. Build exact 2-stage Cauchy-Schwarz screening index for BF16 or S6_K unembed.
+        // On <=18 GiB sm_80+ GPUs, direct register-dequant S6_K GEMV (0.86 ms) beats 461 MiB Q8 screening (1.13 ms)
+        // and frees 461 MiB VRAM (~27K extra FP8 global KV tokens for SQ-12 / SQ-10)!
         const auto& ui = man.get("model.llm.unembed.weight");
         if (build_screen && (ui.fmt == FMT_BF16 || ui.fmt == FMT_S6_K)) {
             INK_CK(ink_cuda_mem_info(&vfree, &vtot));
-            if (vfree > (2048ull << 20)) {
+            const bool skip_s6k_screen = (ui.fmt == FMT_S6_K && sm_cc >= 80 && vtot <= (18ull << 30));
+            if (!skip_s6k_screen && vfree > (2048ull << 20)) {
                 unembed_screen.V = man.c.vocab_unpadded;
                 unembed_screen.q8  = dalloc<int8_t>((size_t)unembed_screen.V * kInkHidden);
                 unembed_screen.sc  = dalloc<float>(unembed_screen.V);
@@ -1578,11 +1581,12 @@ struct InkCudaModel {
         INK_CK(cudaSetDevice(primary_gpu));
         convert_controllers_to_bf16();
 
-        // 5. Optional unembed screening index
+        // 5. Optional unembed screening index (skip 461 MiB S6_K screen on <=18 GiB sm_80+ GPUs: direct S6_K GEMV is faster!)
         const auto& ui = man.get("model.llm.unembed.weight");
         if (build_screen && (ui.fmt == FMT_BF16 || ui.fmt == FMT_S6_K)) {
             INK_CK(ink_cuda_mem_info(&vf0, &vt0, primary_gpu));
-            if (vf0 > (2048ull << 20)) {
+            const bool skip_s6k_screen = (ui.fmt == FMT_S6_K && sm_cc >= 80 && vt0 <= (18ull << 30));
+            if (!skip_s6k_screen && vf0 > (2048ull << 20)) {
                 unembed_screen.V = man.c.vocab_unpadded;
                 unembed_screen.q8  = dalloc<int8_t>((size_t)unembed_screen.V * kInkHidden);
                 unembed_screen.sc  = dalloc<float>(unembed_screen.V);
@@ -2001,17 +2005,17 @@ struct InkCudaRunner {
             const size_t base_ws_res = (max_slots >= 8) ? (1280ull << 20)
                                      : (vtot <= (18ull << 30) && max_slots == 1)
                                          ? ((m.sm_cc >= 80)
-                                             ? ((max_batch <= 256) ? (224ull << 20) : ((max_batch <= 512) ? (288ull << 20) : (448ull << 20)))
+                                             ? ((max_batch <= 256) ? (256ull << 20) : ((max_batch <= 512) ? (352ull << 20) : (512ull << 20)))
                                              : ((max_batch <= 256) ? (448ull << 20) : (560ull << 20)))
                                          : (768ull << 20);
             const size_t dspark_ws_res = m.man.has_dspark
-                                       ? ((vtot <= (18ull << 30) && !m.unembed_screen.ready) ? (128ull << 20) : (256ull << 20))
+                                       ? ((vtot <= (18ull << 30) && !m.unembed_screen.ready) ? (160ull << 20) : (256ull << 20))
                                        : 0ull;
             const size_t os_kv_pad =
 #ifdef _WIN32
                 (wddm_fl / 2);
 #else
-                (vtot <= (18ull << 30) && max_slots == 1) ? (128ull << 20) : (wddm_fl / 2);
+                (vtot <= (18ull << 30) && max_slots == 1) ? (192ull << 20) : (wddm_fl / 2);
 #endif
             const size_t ws_reserve = base_ws_res + dspark_ws_res + os_kv_pad;
             const size_t avail_glob = (vfree > swa_kv_bytes + sconv_bytes + ws_reserve)
@@ -2345,6 +2349,7 @@ struct InkCudaRunner {
         const int step = std::max(8192, std::min(32768, old_cap));
         int new_cap = std::min(max_ctx, std::max(needed_pos, ((old_cap + step - 1) / step + 1) * step));
         new_cap = std::min(max_ctx, ((new_cap + 63) & ~63));
+        if (max_ctx - new_cap <= 4096) new_cap = max_ctx;
 
         const size_t per_pos = kv_bytes_per_visit_pos(kv_dtype);
         const size_t single_k_per_pos = (kv_dtype == InkKvDtype::FP16)
@@ -2359,7 +2364,9 @@ struct InkCudaRunner {
             size_t vf = 0, vt = 0;
             const int dev = m.ls_active ? m.stage_gpu[s] : m.primary_gpu;
             if (ink_cuda_mem_info(&vf, &vt, dev) != cudaSuccess) return false;
-            const size_t floor_b = (vt <= (18ull << 30)) ? (96ull << 20) : (256ull << 20);
+            const size_t floor_b = (vt <= (18ull << 30))
+                ? ((kv_offload_mode < 0) ? (64ull << 20) : (96ull << 20))
+                : (256ull << 20);
             auto peak_extra_bytes = [&](int cap) -> size_t {
                 const size_t delta_b = (size_t)n_glob_s * max_slots * (size_t)(cap - old_cap) * per_pos;
                 const size_t tmp_k_b = (size_t)max_slots * (size_t)old_cap * single_k_per_pos;
@@ -2367,7 +2374,11 @@ struct InkCudaRunner {
             };
             const size_t need_b = peak_extra_bytes(new_cap);
             if (vf <= floor_b + need_b) {
-                const int tight_cap = std::min(max_ctx, ((needed_pos + 255) & ~255));
+                const size_t tmp_k_b = (size_t)max_slots * (size_t)old_cap * single_k_per_pos;
+                const size_t fit_extra_b = (vf > floor_b + tmp_k_b) ? (vf - floor_b - tmp_k_b) : 0u;
+                const int max_fit_cap = old_cap + (int)(fit_extra_b / std::max<size_t>(1, (size_t)n_glob_s * max_slots * per_pos));
+                int tight_cap = std::min(max_ctx, (max_fit_cap & ~255));
+                if (tight_cap < needed_pos) tight_cap = std::min(max_ctx, ((needed_pos + 255) & ~255));
                 const size_t tight_b = peak_extra_bytes(tight_cap);
                 if (vf <= floor_b + tight_b) {
                     // VRAM cannot grow global KV further: seamlessly spill tail [kv_dev_ctx..new_cap-1] into mapped pinned host RAM!
