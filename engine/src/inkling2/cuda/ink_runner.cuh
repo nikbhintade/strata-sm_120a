@@ -236,6 +236,7 @@ struct InkCudaModel {
     size_t   stage_n_experts[kMaxStages]  = {};
     std::unordered_map<std::string, size_t> stage_trunk_off[kMaxStages];
     int sm_cc = 0;  // major * 10 + minor (e.g. 60, 61, 70, 75, 86, 89, 120, 121)
+    int sm_count = 0;  // primary GPU SM count (e.g. 36 on RTX 5060 Ti, 170 on RTX 5090)
     bool trunk_attn_fp16 = false;  // true on sm_70/75: .attn.* BF16 weights converted in-place to FP16 at load!
     bool ctrl_is_bf16 = false;     // true on sm_80+: 144 FP32 loop controller weights converted in-place to BF16 at load!
 
@@ -346,6 +347,7 @@ struct InkCudaModel {
             cudaDeviceProp prop{};
             INK_CK(cudaGetDeviceProperties(&prop, primary_gpu));
             sm_cc = prop.major * 10 + prop.minor;
+            sm_count = prop.multiProcessorCount;
         }
         if (!rd.open(strata_path, err)) return false;
         parse_ink_manifest(rd.manifest_json(), man, true);
@@ -867,6 +869,10 @@ struct InkCudaModel {
         }
         INK_CK(cudaSetDevice(primary_gpu));
         sm_cc = gpu_cc[0];
+        {
+            cudaDeviceProp p0{};
+            if (cudaGetDeviceProperties(&p0, primary_gpu) == cudaSuccess) sm_count = p0.multiProcessorCount;
+        }
         stage_cc[0] = sm_cc;
         stage_trunk_attn_fp16[0] = (sm_cc >= 70 && sm_cc < 80);
 
@@ -1996,7 +2002,13 @@ struct InkCudaRunner {
             const size_t dspark_ws_res = m.man.has_dspark
                                        ? ((vtot <= (18ull << 30) && !m.unembed_screen.ready) ? (128ull << 20) : (256ull << 20))
                                        : 0ull;
-            const size_t ws_reserve = base_ws_res + dspark_ws_res + (wddm_fl / 2);
+            const size_t os_kv_pad =
+#ifdef _WIN32
+                (wddm_fl / 2);
+#else
+                (vtot <= (18ull << 30) && max_slots == 1) ? (128ull << 20) : (wddm_fl / 2);
+#endif
+            const size_t ws_reserve = base_ws_res + dspark_ws_res + os_kv_pad;
             const size_t avail_glob = (vfree > swa_kv_bytes + sconv_bytes + ws_reserve)
                 ? (vfree - swa_kv_bytes - sconv_bytes - ws_reserve) : 0u;
             const size_t per_pos_glob = (size_t)std::max(1, n_glob_g0) * max_slots * per_visit_pos
@@ -2209,7 +2221,7 @@ struct InkCudaRunner {
         if (m.sm_cc >= 60 && max_slots <= 4 && max_batch >= 128) {
             size_t vf = 0, vt = 0;
             INK_CK(ink_cuda_mem_info(&vf, &vt, m.primary_gpu));
-            const size_t pf_min_vf = (vt <= (18ull << 30)) ? (224ull << 20) : (320ull << 20);
+            const size_t pf_min_vf = (vt <= (18ull << 30)) ? (208ull << 20) : (320ull << 20);
             if (vf > pf_min_vf) ensure_pf_attn(kInkPfKvTile);
         }
 
@@ -2992,7 +3004,7 @@ struct InkCudaRunner {
         size_t vf = 0, vt = 0;
         const int dev = m.ls_active ? m.stage_gpu[cur_stage] : m.primary_gpu;
         if (ink_cuda_mem_info(&vf, &vt, dev) != cudaSuccess) return false;
-        const size_t pf_margin = (vt <= (18ull << 30)) ? (112ull << 20) : (192ull << 20);
+        const size_t pf_margin = (vt <= (18ull << 30)) ? (96ull << 20) : (192ull << 20);
         if (vf < need + pf_margin) return false;
         if (cudaMalloc(&d_pf_q, q_b) != cudaSuccess ||
             cudaMalloc(&d_pf_k, kv_b) != cudaSuccess ||
