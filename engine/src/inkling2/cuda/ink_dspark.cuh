@@ -1506,7 +1506,17 @@ struct InkDSpark {
         const bool pack_ho = (cache_is_fp16 || m.tinfo(ho_w).fmt != FMT_BF16);
         if (pack_rn) tot_elems += (size_t)m.tinfo(rn_w).rows() * m.tinfo(rn_w).cols();
         if (pack_ho) tot_elems += (size_t)m.tinfo(ho_w).rows() * m.tinfo(ho_w).cols();
-        if (m.sm_cc >= 70 && vfree > tot_elems * 2 + (256ull << 20)) {
+        // Reserve future elastic global KV growth (target + DSpark) before allocating the ~512 MiB BF16 draft cache,
+        // and on <=18 GiB sm_80+ GPUs keep quantized S_K weights compressed (saves ~512 MiB VRAM for 128K KV and speeds up B=8 draft!).
+        const bool dspark_is_quant = (m.tinfo("dspark.layers.0.mlp.gate_proj.weight").fmt != FMT_BF16);
+        const size_t dspark_glob_bpp = ctx_glob_fp8
+            ? ((size_t)kInkKVHeads * kInkHeadDim * 2u + (size_t)kInkKVHeads * 8u)
+            : ((size_t)kInkKVHeads * kInkHeadDim * 4u);
+        const size_t future_kv_need = (r.max_ctx > r.kv_alloc_ctx)
+            ? (size_t)(r.max_ctx - r.kv_alloc_ctx) * ((size_t)8 * r.max_slots * InkCudaRunner::kv_bytes_per_visit_pos(r.kv_dtype) + dspark_glob_bpp)
+            : 0ull;
+        const bool allow_bf16_pool = !(m.sm_cc >= 80 && vtot <= (18ull << 30) && dspark_is_quant);
+        if (m.sm_cc >= 70 && allow_bf16_pool && vfree > tot_elems * 2 + future_kv_need + (256ull << 20)) {
             d_bf16_pool = dalloc<uint16_t>(tot_elems);
             size_t cur = 0;
             for (int il = 0; il < 3; ++il) {
