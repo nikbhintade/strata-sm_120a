@@ -237,6 +237,43 @@ struct InkCudaModel {
     std::unordered_map<std::string, size_t> stage_trunk_off[kMaxStages];
     int sm_cc = 0;  // major * 10 + minor (e.g. 60, 61, 70, 75, 86, 89, 120, 121)
     bool trunk_attn_fp16 = false;  // true on sm_70/75: .attn.* BF16 weights converted in-place to FP16 at load!
+    bool ctrl_is_bf16 = false;     // true on sm_80+: 144 FP32 loop controller weights converted in-place to BF16 at load!
+
+    void convert_controllers_to_bf16() {
+        ctrl_is_bf16 = false;
+        if (sm_cc < 80 || ls_active || !d_trunk) return;
+        static const char* kCtrlNames[4] = {"attn", "k", "v", "mlp"};
+        static const char* kWNames[3]    = {"down_weight", "gain_weight", "forget_weight"};
+        size_t max_elems = 0;
+        for (int i = 0; i < 12; ++i) {
+            const std::string p = "model.llm.layers." + std::to_string(man.c.core_start + i) + ".controllers.";
+            for (const char* cn : kCtrlNames) {
+                for (const char* wn : kWNames) {
+                    const std::string full = p + cn + "." + wn;
+                    const auto* ti = man.find(full);
+                    if (!ti || ti->fmt != FMT_F32) return;
+                    max_elems = std::max(max_elems, (size_t)ti->bytes / 4u);
+                }
+            }
+        }
+        if (max_elems == 0) return;
+        __nv_bfloat16* d_tmp = dalloc<__nv_bfloat16>(max_elems);
+        for (int i = 0; i < 12; ++i) {
+            const std::string p = "model.llm.layers." + std::to_string(man.c.core_start + i) + ".controllers.";
+            for (const char* cn : kCtrlNames) {
+                for (const char* wn : kWNames) {
+                    const auto& ti = man.get(p + cn + "." + wn);
+                    const size_t n = (size_t)ti.bytes / 4u;
+                    const float* src = reinterpret_cast<const float*>(d_trunk + ti.off);
+                    k_ink_f32_to_bf16<<<((n + 3) / 4 + 255) / 256, 256>>>(src, d_tmp, n);
+                    INK_CK(cudaMemcpy(d_trunk + ti.off, d_tmp, n * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+                }
+            }
+        }
+        INK_CK(cudaDeviceSynchronize());
+        INK_CK(cudaFree(d_tmp));
+        ctrl_is_bf16 = true;
+    }
 
     uint8_t* d_trunk = nullptr;
     uint8_t* d_sec4  = nullptr;
@@ -622,6 +659,7 @@ struct InkCudaModel {
                 d_sconv_v[il] = flip_t(p + ".attn.v_sconv.static_w");
             }
         }
+        convert_controllers_to_bf16();
 
         // 4. Build exact 2-stage Cauchy-Schwarz screening index for BF16 or S6_K unembed (SQ-20, SQ-15, SQ-10)!
         const auto& ui = man.get("model.llm.unembed.weight");
@@ -1531,6 +1569,7 @@ struct InkCudaModel {
             }
         }
         INK_CK(cudaSetDevice(primary_gpu));
+        convert_controllers_to_bf16();
 
         // 5. Optional unembed screening index
         const auto& ui = man.get("model.llm.unembed.weight");
@@ -2170,7 +2209,8 @@ struct InkCudaRunner {
         if (m.sm_cc >= 60 && max_slots <= 4 && max_batch >= 128) {
             size_t vf = 0, vt = 0;
             INK_CK(ink_cuda_mem_info(&vf, &vt, m.primary_gpu));
-            if (vf > (320ull << 20)) ensure_pf_attn(kInkPfKvTile);
+            const size_t pf_min_vf = (vt <= (18ull << 30)) ? (224ull << 20) : (320ull << 20);
+            if (vf > pf_min_vf) ensure_pf_attn(kInkPfKvTile);
         }
 
         if (m.ls_active) {
@@ -2469,36 +2509,94 @@ struct InkCudaRunner {
     // ---- High-Speed Rank-64 Loop Controller + RMSNorm Dispatcher (100x faster than single-CTA!) ----
     void run_loop_control_norm(
         const float* cur, const float* msg,
-        const float* w_down, const float* w_gain, const float* w_forget,
+        const void* w_down_raw, const void* w_gain_raw, const void* w_forget_raw,
         const float* norm_w, float* out, int M,
-        bool cat_ready = false, bool exact_fp32 = false) {
+        bool cat_ready = false, bool exact_fp32 = false, const void* cat_ptr = nullptr, bool cat_is_bf16 = false) {
         constexpr int D = kInkHidden;
         constexpr int D2 = 2 * D;
-        if (!cat_ready) k_ink_ctrl_cat_rms<<<M, 256, 0, st>>>(cur, msg, d_ctrl_cat, M, D);
+        const void* cat_raw = cat_ptr ? cat_ptr : (const void*)d_ctrl_cat;
+        if (!cat_ready) {
+            k_ink_ctrl_cat_rms<<<M, 256, 0, st>>>(cur, msg, d_ctrl_cat, M, D);
+            cat_raw = d_ctrl_cat;
+            cat_is_bf16 = false;
+        }
         if (M <= 16) {
-            if (M == 1) {
-                k_ink_ctrl_down_smallM<1><<<kInkGateRank, 256, 0, st>>>(d_ctrl_cat, w_down, d_ctrl_gate, M, D2);
-                k_ink_ctrl_apply_smallM<1><<<D / 16, 256, 0, st>>>(cur, msg, d_ctrl_gate, w_gain, w_forget, out, M, D);
-            } else if (M <= 4) {
-                k_ink_ctrl_down_smallM<4><<<kInkGateRank, 256, 0, st>>>(d_ctrl_cat, w_down, d_ctrl_gate, M, D2);
-                k_ink_ctrl_apply_smallM<4><<<D / 16, 256, 0, st>>>(cur, msg, d_ctrl_gate, w_gain, w_forget, out, M, D);
-            } else if (M <= 8) {
-                k_ink_ctrl_down_smallM<8><<<kInkGateRank, 256, 0, st>>>(d_ctrl_cat, w_down, d_ctrl_gate, M, D2);
-                k_ink_ctrl_apply_smallM<8><<<D / 16, 256, 0, st>>>(cur, msg, d_ctrl_gate, w_gain, w_forget, out, M, D);
+            const float* cat = reinterpret_cast<const float*>(cat_raw);
+            if (m.ctrl_is_bf16) {
+                const auto* wd = reinterpret_cast<const __nv_bfloat16*>(w_down_raw);
+                const auto* wg = reinterpret_cast<const __nv_bfloat16*>(w_gain_raw);
+                const auto* wf = reinterpret_cast<const __nv_bfloat16*>(w_forget_raw);
+                if (M == 1) {
+                    k_ink_ctrl_down_smallM_bf16<1><<<kInkGateRank, 256, 0, st>>>(cat, wd, d_ctrl_gate, M, D2);
+                    k_ink_ctrl_apply_smallM_bf16<1><<<D / 32, 256, 0, st>>>(cur, msg, d_ctrl_gate, wg, wf, out, M, D);
+                } else if (M <= 4) {
+                    k_ink_ctrl_down_smallM_bf16<4><<<kInkGateRank, 256, 0, st>>>(cat, wd, d_ctrl_gate, M, D2);
+                    k_ink_ctrl_apply_smallM_bf16<4><<<D / 32, 256, 0, st>>>(cur, msg, d_ctrl_gate, wg, wf, out, M, D);
+                } else if (M <= 8) {
+                    k_ink_ctrl_down_smallM_bf16<8><<<kInkGateRank, 256, 0, st>>>(cat, wd, d_ctrl_gate, M, D2);
+                    k_ink_ctrl_apply_smallM_bf16<8><<<D / 32, 256, 0, st>>>(cur, msg, d_ctrl_gate, wg, wf, out, M, D);
+                } else {
+                    k_ink_ctrl_down_smallM_bf16<16><<<kInkGateRank, 256, 0, st>>>(cat, wd, d_ctrl_gate, M, D2);
+                    k_ink_ctrl_apply_smallM_bf16<16><<<D / 32, 256, 0, st>>>(cur, msg, d_ctrl_gate, wg, wf, out, M, D);
+                }
             } else {
-                k_ink_ctrl_down_smallM<16><<<kInkGateRank, 256, 0, st>>>(d_ctrl_cat, w_down, d_ctrl_gate, M, D2);
-                k_ink_ctrl_apply_smallM<16><<<D / 16, 256, 0, st>>>(cur, msg, d_ctrl_gate, w_gain, w_forget, out, M, D);
+                const float* w_down   = reinterpret_cast<const float*>(w_down_raw);
+                const float* w_gain   = reinterpret_cast<const float*>(w_gain_raw);
+                const float* w_forget = reinterpret_cast<const float*>(w_forget_raw);
+                if (M == 1) {
+                    k_ink_ctrl_down_smallM<1><<<kInkGateRank, 256, 0, st>>>(cat, w_down, d_ctrl_gate, M, D2);
+                    k_ink_ctrl_apply_smallM<1><<<D / 16, 256, 0, st>>>(cur, msg, d_ctrl_gate, w_gain, w_forget, out, M, D);
+                } else if (M <= 4) {
+                    k_ink_ctrl_down_smallM<4><<<kInkGateRank, 256, 0, st>>>(cat, w_down, d_ctrl_gate, M, D2);
+                    k_ink_ctrl_apply_smallM<4><<<D / 16, 256, 0, st>>>(cur, msg, d_ctrl_gate, w_gain, w_forget, out, M, D);
+                } else if (M <= 8) {
+                    k_ink_ctrl_down_smallM<8><<<kInkGateRank, 256, 0, st>>>(cat, w_down, d_ctrl_gate, M, D2);
+                    k_ink_ctrl_apply_smallM<8><<<D / 16, 256, 0, st>>>(cur, msg, d_ctrl_gate, w_gain, w_forget, out, M, D);
+                } else {
+                    k_ink_ctrl_down_smallM<16><<<kInkGateRank, 256, 0, st>>>(cat, w_down, d_ctrl_gate, M, D2);
+                    k_ink_ctrl_apply_smallM<16><<<D / 16, 256, 0, st>>>(cur, msg, d_ctrl_gate, w_gain, w_forget, out, M, D);
+                }
             }
             if (norm_w) k_ink_rms_norm<<<M, 256, 0, st>>>(out, norm_w, out, nullptr, M, D);
         } else {
             const float alpha = 1.0f, beta = 0.0f;
-            if (!exact_fp32 && m.sm_cc >= 70 && m.sm_cc < 80) {
+            if (m.ctrl_is_bf16 && m.sm_cc >= 80) {
+                const auto* wd = reinterpret_cast<const __nv_bfloat16*>(w_down_raw);
+                const auto* wg = reinterpret_cast<const __nv_bfloat16*>(w_gain_raw);
+                const auto* wf = reinterpret_cast<const __nv_bfloat16*>(w_forget_raw);
+                const __nv_bfloat16* cat_b = nullptr;
+                if (cat_is_bf16) {
+                    cat_b = reinterpret_cast<const __nv_bfloat16*>(cat_raw);
+                } else {
+                    const size_t nx_d = (size_t)M * D2;
+                    k_ink_f32_to_bf16<<<((nx_d + 3) / 4 + 255) / 256, 256, 0, st>>>(reinterpret_cast<const float*>(cat_raw), d_x_bf16, nx_d);
+                    cat_b = d_x_bf16;
+                }
+                INK_CUBLAS_CK(cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N, kInkGateRank, M, D2, &alpha,
+                    wd, CUDA_R_16BF, D2, cat_b, CUDA_R_16BF, D2, &beta,
+                    d_ctrl_gate, CUDA_R_32F, kInkGateRank, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                const size_t nx_g = (size_t)M * kInkGateRank;
+                k_ink_f32_to_bf16<<<((nx_g + 3) / 4 + 255) / 256, 256, 0, st>>>(d_ctrl_gate, d_x_bf16, nx_g);
+                INK_CUBLAS_CK(cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N, D, M, kInkGateRank, &alpha,
+                    wg, CUDA_R_16BF, kInkGateRank, d_x_bf16, CUDA_R_16BF, kInkGateRank, &beta,
+                    d_ctrl_gain, CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                INK_CUBLAS_CK(cublasGemmEx(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N, D, M, kInkGateRank, &alpha,
+                    wf, CUDA_R_16BF, kInkGateRank, d_x_bf16, CUDA_R_16BF, kInkGateRank, &beta,
+                    d_ctrl_forget, CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            } else if (!exact_fp32 && m.sm_cc >= 70 && m.sm_cc < 80) {
+                const float* cat      = reinterpret_cast<const float*>(cat_raw);
+                const float* w_down   = reinterpret_cast<const float*>(w_down_raw);
+                const float* w_gain   = reinterpret_cast<const float*>(w_gain_raw);
+                const float* w_forget = reinterpret_cast<const float*>(w_forget_raw);
                 // Volta sm_70 (V100) / Turing sm_75 (2080 Ti): 125 TFLOPS FP16 TC for loop controller GEMMs (4x faster than FP32!)
                 __half* x_h = reinterpret_cast<__half*>(d_x_bf16);
                 __half* w_h = reinterpret_cast<__half*>(d_w_scratch);
                 const size_t nx_d = (size_t)M * D2;
                 const size_t nw_d = (size_t)kInkGateRank * D2;
-                k_ink_f32_to_fp16<<<(nx_d + 255) / 256, 256, 0, st>>>(d_ctrl_cat, x_h, nx_d);
+                k_ink_f32_to_fp16<<<(nx_d + 255) / 256, 256, 0, st>>>(cat, x_h, nx_d);
                 k_ink_f32_to_fp16<<<(nw_d + 255) / 256, 256, 0, st>>>(w_down, w_h, nw_d);
                 INK_CUBLAS_CK(cublasGemmEx(
                     cublas, CUBLAS_OP_T, CUBLAS_OP_N, kInkGateRank, M, D2, &alpha,
@@ -2518,10 +2616,14 @@ struct InkCudaRunner {
                     w_h, CUDA_R_16F, kInkGateRank, x_h, CUDA_R_16F, kInkGateRank, &beta,
                     d_ctrl_forget, CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             } else {
+                const float* cat      = reinterpret_cast<const float*>(cat_raw);
+                const float* w_down   = reinterpret_cast<const float*>(w_down_raw);
+                const float* w_gain   = reinterpret_cast<const float*>(w_gain_raw);
+                const float* w_forget = reinterpret_cast<const float*>(w_forget_raw);
                 const cublasComputeType_t ctype = (!exact_fp32 && m.sm_cc >= 80) ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
                 INK_CUBLAS_CK(cublasGemmEx(
                     cublas, CUBLAS_OP_T, CUBLAS_OP_N, kInkGateRank, M, D2, &alpha,
-                    w_down, CUDA_R_32F, D2, d_ctrl_cat, CUDA_R_32F, D2, &beta,
+                    w_down, CUDA_R_32F, D2, cat, CUDA_R_32F, D2, &beta,
                     d_ctrl_gate, CUDA_R_32F, kInkGateRank, ctype, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
                 INK_CUBLAS_CK(cublasGemmEx(
                     cublas, CUBLAS_OP_T, CUBLAS_OP_N, D, M, kInkGateRank, &alpha,
@@ -2889,7 +2991,9 @@ struct InkCudaRunner {
         const size_t need = q_b + 2 * kv_b + s_b + p_b + 2 * o_b + 2 * ml_b;
         size_t vf = 0, vt = 0;
         const int dev = m.ls_active ? m.stage_gpu[cur_stage] : m.primary_gpu;
-        if (ink_cuda_mem_info(&vf, &vt, dev) != cudaSuccess || vf < need + (192ull << 20)) return false;
+        if (ink_cuda_mem_info(&vf, &vt, dev) != cudaSuccess) return false;
+        const size_t pf_margin = (vt <= (18ull << 30)) ? (112ull << 20) : (192ull << 20);
+        if (vf < need + pf_margin) return false;
         if (cudaMalloc(&d_pf_q, q_b) != cudaSuccess ||
             cudaMalloc(&d_pf_k, kv_b) != cudaSuccess ||
             cudaMalloc(&d_pf_v, kv_b) != cudaSuccess ||
@@ -2940,41 +3044,72 @@ struct InkCudaRunner {
                 in_k = is_swa ? d_mixed : (d_mixed + 1 * n_hid);
                 in_v = is_swa ? d_mixed : (d_mixed + 2 * n_hid);
             } else {
+                const bool pf_cat_bf16 = (M > 16) && m.ctrl_is_bf16 && (m.sm_cc >= 80);
                 k_ink_attn_res_3x_cat_rms<<<dim3(M, 4), 256, 0, st>>>(
                     stp, q_res, is_swa, *bank_stp, m.d_msg_queries[ip - m.man.c.core_start],
-                    d_mixed, d_msgs, (M <= 16) ? d_ctrl_cat : nullptr, M, kInkHidden);
+                    d_mixed, d_msgs, d_ctrl_cat, M, kInkHidden, pf_cat_bf16);
                 const float* src0 = d_mixed;
                 const float* src1 = d_mixed + 1 * n_hid;
                 const float* src2 = d_mixed + 2 * n_hid;
-                const float* wd0 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.down_weight");
-                const float* wg0 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.gain_weight");
-                const float* wf0 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.forget_weight");
-                const float* wd1 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.k.down_weight");
-                const float* wg1 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.k.gain_weight");
-                const float* wf1 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.k.forget_weight");
-                const float* wd2 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.v.down_weight");
-                const float* wg2 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.v.gain_weight");
-                const float* wf2 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.v.forget_weight");
+                const void* wd0 = m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.down_weight");
+                const void* wg0 = m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.gain_weight");
+                const void* wf0 = m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.forget_weight");
+                const void* wd1 = m.trunk_ptr_stage(cur_stage, p + ".controllers.k.down_weight");
+                const void* wg1 = m.trunk_ptr_stage(cur_stage, p + ".controllers.k.gain_weight");
+                const void* wf1 = m.trunk_ptr_stage(cur_stage, p + ".controllers.k.forget_weight");
+                const void* wd2 = m.trunk_ptr_stage(cur_stage, p + ".controllers.v.down_weight");
+                const void* wg2 = m.trunk_ptr_stage(cur_stage, p + ".controllers.v.gain_weight");
+                const void* wf2 = m.trunk_ptr_stage(cur_stage, p + ".controllers.v.forget_weight");
                 if (M <= 16) {
                     constexpr int D = kInkHidden, D2 = 2 * kInkHidden;
-                    if (M == 1) {
-                        k_ink_ctrl_3x_down_smallM<1><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, wd0, wd1, wd2, d_ctrl_gate, M, D2);
-                        k_ink_ctrl_3x_apply_smallM<1><<<dim3(D / 16, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, wg0, wg1, wg2, wf0, wf1, wf2, d_inp0, d_inp1, d_inp2, M, D);
-                    } else if (M <= 4) {
-                        k_ink_ctrl_3x_down_smallM<4><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, wd0, wd1, wd2, d_ctrl_gate, M, D2);
-                        k_ink_ctrl_3x_apply_smallM<4><<<dim3(D / 16, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, wg0, wg1, wg2, wf0, wf1, wf2, d_inp0, d_inp1, d_inp2, M, D);
-                    } else if (M <= 8) {
-                        k_ink_ctrl_3x_down_smallM<8><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, wd0, wd1, wd2, d_ctrl_gate, M, D2);
-                        k_ink_ctrl_3x_apply_smallM<8><<<dim3(D / 16, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, wg0, wg1, wg2, wf0, wf1, wf2, d_inp0, d_inp1, d_inp2, M, D);
+                    if (m.ctrl_is_bf16) {
+                        const auto *b_wd0 = (const __nv_bfloat16*)wd0, *b_wd1 = (const __nv_bfloat16*)wd1, *b_wd2 = (const __nv_bfloat16*)wd2;
+                        const auto *b_wg0 = (const __nv_bfloat16*)wg0, *b_wg1 = (const __nv_bfloat16*)wg1, *b_wg2 = (const __nv_bfloat16*)wg2;
+                        const auto *b_wf0 = (const __nv_bfloat16*)wf0, *b_wf1 = (const __nv_bfloat16*)wf1, *b_wf2 = (const __nv_bfloat16*)wf2;
+                        if (M == 1) {
+                            k_ink_ctrl_3x_down_smallM_bf16<1><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, b_wd0, b_wd1, b_wd2, d_ctrl_gate, M, D2);
+                            k_ink_ctrl_3x_apply_smallM_bf16<1><<<dim3(D / 32, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, b_wg0, b_wg1, b_wg2, b_wf0, b_wf1, b_wf2, d_inp0, d_inp1, d_inp2, M, D);
+                        } else if (M <= 4) {
+                            k_ink_ctrl_3x_down_smallM_bf16<4><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, b_wd0, b_wd1, b_wd2, d_ctrl_gate, M, D2);
+                            k_ink_ctrl_3x_apply_smallM_bf16<4><<<dim3(D / 32, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, b_wg0, b_wg1, b_wg2, b_wf0, b_wf1, b_wf2, d_inp0, d_inp1, d_inp2, M, D);
+                        } else if (M <= 8) {
+                            k_ink_ctrl_3x_down_smallM_bf16<8><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, b_wd0, b_wd1, b_wd2, d_ctrl_gate, M, D2);
+                            k_ink_ctrl_3x_apply_smallM_bf16<8><<<dim3(D / 32, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, b_wg0, b_wg1, b_wg2, b_wf0, b_wf1, b_wf2, d_inp0, d_inp1, d_inp2, M, D);
+                        } else {
+                            k_ink_ctrl_3x_down_smallM_bf16<16><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, b_wd0, b_wd1, b_wd2, d_ctrl_gate, M, D2);
+                            k_ink_ctrl_3x_apply_smallM_bf16<16><<<dim3(D / 32, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, b_wg0, b_wg1, b_wg2, b_wf0, b_wf1, b_wf2, d_inp0, d_inp1, d_inp2, M, D);
+                        }
                     } else {
-                        k_ink_ctrl_3x_down_smallM<16><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, wd0, wd1, wd2, d_ctrl_gate, M, D2);
-                        k_ink_ctrl_3x_apply_smallM<16><<<dim3(D / 16, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, wg0, wg1, wg2, wf0, wf1, wf2, d_inp0, d_inp1, d_inp2, M, D);
+                        const auto *f_wd0 = (const float*)wd0, *f_wd1 = (const float*)wd1, *f_wd2 = (const float*)wd2;
+                        const auto *f_wg0 = (const float*)wg0, *f_wg1 = (const float*)wg1, *f_wg2 = (const float*)wg2;
+                        const auto *f_wf0 = (const float*)wf0, *f_wf1 = (const float*)wf1, *f_wf2 = (const float*)wf2;
+                        if (M == 1) {
+                            k_ink_ctrl_3x_down_smallM<1><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, f_wd0, f_wd1, f_wd2, d_ctrl_gate, M, D2);
+                            k_ink_ctrl_3x_apply_smallM<1><<<dim3(D / 16, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, f_wg0, f_wg1, f_wg2, f_wf0, f_wf1, f_wf2, d_inp0, d_inp1, d_inp2, M, D);
+                        } else if (M <= 4) {
+                            k_ink_ctrl_3x_down_smallM<4><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, f_wd0, f_wd1, f_wd2, d_ctrl_gate, M, D2);
+                            k_ink_ctrl_3x_apply_smallM<4><<<dim3(D / 16, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, f_wg0, f_wg1, f_wg2, f_wf0, f_wf1, f_wf2, d_inp0, d_inp1, d_inp2, M, D);
+                        } else if (M <= 8) {
+                            k_ink_ctrl_3x_down_smallM<8><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, f_wd0, f_wd1, f_wd2, d_ctrl_gate, M, D2);
+                            k_ink_ctrl_3x_apply_smallM<8><<<dim3(D / 16, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, f_wg0, f_wg1, f_wg2, f_wf0, f_wf1, f_wf2, d_inp0, d_inp1, d_inp2, M, D);
+                        } else {
+                            k_ink_ctrl_3x_down_smallM<16><<<dim3(kInkGateRank, 3), 256, 0, st>>>(d_ctrl_cat, f_wd0, f_wd1, f_wd2, d_ctrl_gate, M, D2);
+                            k_ink_ctrl_3x_apply_smallM<16><<<dim3(D / 16, 3), 256, 0, st>>>(src0, src1, src2, d_msgs, d_ctrl_gate, f_wg0, f_wg1, f_wg2, f_wf0, f_wf1, f_wf2, d_inp0, d_inp1, d_inp2, M, D);
+                        }
                     }
                     k_ink_rms_norm_3x<<<dim3(M, 3), 256, 0, st>>>(d_inp0, d_inp1, d_inp2, nw_q, nw_k, nw_v, M, D);
                 } else {
-                    run_loop_control_norm(src0, d_msgs + 0 * n_hid, wd0, wg0, wf0, nw_q, d_inp0, M, false, exact_x);
-                    run_loop_control_norm(src1, d_msgs + 1 * n_hid, wd1, wg1, wf1, nw_k, d_inp1, M, false, exact_x);
-                    run_loop_control_norm(src2, d_msgs + 2 * n_hid, wd2, wg2, wf2, nw_v, d_inp2, M, false, exact_x);
+                    const size_t cat_stride = (size_t)M * (2 * kInkHidden);
+                    if (pf_cat_bf16) {
+                        const auto* cb = reinterpret_cast<const __nv_bfloat16*>(d_ctrl_cat);
+                        run_loop_control_norm(src0, d_msgs + 0 * n_hid, wd0, wg0, wf0, nw_q, d_inp0, M, true, exact_x, cb + 0 * cat_stride, true);
+                        run_loop_control_norm(src1, d_msgs + 1 * n_hid, wd1, wg1, wf1, nw_k, d_inp1, M, true, exact_x, cb + 1 * cat_stride, true);
+                        run_loop_control_norm(src2, d_msgs + 2 * n_hid, wd2, wg2, wf2, nw_v, d_inp2, M, true, exact_x, cb + 2 * cat_stride, true);
+                    } else {
+                        run_loop_control_norm(src0, d_msgs + 0 * n_hid, wd0, wg0, wf0, nw_q, d_inp0, M, true, exact_x, d_ctrl_cat + 0 * cat_stride, false);
+                        run_loop_control_norm(src1, d_msgs + 1 * n_hid, wd1, wg1, wf1, nw_k, d_inp1, M, true, exact_x, d_ctrl_cat + 1 * cat_stride, false);
+                        run_loop_control_norm(src2, d_msgs + 2 * n_hid, wd2, wg2, wf2, nw_v, d_inp2, M, true, exact_x, d_ctrl_cat + 2 * cat_stride, false);
+                    }
                 }
                 in_q = d_inp0; in_k = d_inp1; in_v = d_inp2;
             }
@@ -3208,13 +3343,14 @@ struct InkCudaRunner {
             stp.count = n_blocks + 1;
             const float* q_mlp = (const float*)m.trunk_ptr_stage(cur_stage, "model.llm.attn_res.mlp_queries." + std::to_string(ip));
             if (has_msg) {
-                k_ink_mlp_res_cat_rms<<<M, 256, 0, st>>>(stp, q_mlp, d_msgs + 3 * n_hid, d_moe_in, d_ctrl_cat, M, kInkHidden);
+                const bool pf_cat_bf16 = (M > 16) && m.ctrl_is_bf16 && (m.sm_cc >= 80);
+                k_ink_mlp_res_cat_rms<<<M, 256, 0, st>>>(stp, q_mlp, d_msgs + 3 * n_hid, d_moe_in, d_ctrl_cat, M, kInkHidden, pf_cat_bf16);
                 run_loop_control_norm(
                     d_moe_in, d_msgs + 3 * n_hid,
-                    (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.mlp.down_weight"),
-                    (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.mlp.gain_weight"),
-                    (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.mlp.forget_weight"),
-                    mlp_nw, d_moe_in, M, /*cat_ready=*/true, exact_x);
+                    m.trunk_ptr_stage(cur_stage, p + ".controllers.mlp.down_weight"),
+                    m.trunk_ptr_stage(cur_stage, p + ".controllers.mlp.gain_weight"),
+                    m.trunk_ptr_stage(cur_stage, p + ".controllers.mlp.forget_weight"),
+                    mlp_nw, d_moe_in, M, /*cat_ready=*/true, exact_x, d_ctrl_cat, pf_cat_bf16);
             } else {
                 k_ink_attn_res_mix<<<M, 256, 0, st>>>(stp, q_mlp, d_moe_in, 1, M, kInkHidden, mlp_nw);
             }

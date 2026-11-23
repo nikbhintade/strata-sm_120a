@@ -502,6 +502,193 @@ __global__ void __launch_bounds__(256) k_ink_ctrl_3x_apply_smallM(
     }
 }
 
+// BF16-weight loop controller small-M kernels (2x fewer weight bytes read: 8 BF16s per uint4, 32 rows/CTA for apply!)
+template <int MAX_M>
+__global__ void __launch_bounds__(256) k_ink_ctrl_down_smallM_bf16(
+    const float* __restrict__ cat,             // [M, 4608]
+    const __nv_bfloat16* __restrict__ w_down,  // [64, 4608] BF16
+    float* __restrict__ gate,                  // [M, 64]
+    int M, int D2) {
+    const int r = blockIdx.x;
+    if (r >= kInkGateRank) return;
+    const int tid = threadIdx.x;
+    const int D2_8 = D2 >> 3;
+    const uint4* wr = reinterpret_cast<const uint4*>(w_down + (size_t)r * D2);
+    float acc[MAX_M] = {};
+    for (int i = tid; i < D2_8; i += 256) {
+        const uint4 wv = wr[i];
+        const float2 w0 = bf16x2_to_f32x2(wv.x), w1 = bf16x2_to_f32x2(wv.y);
+        const float2 w2 = bf16x2_to_f32x2(wv.z), w3 = bf16x2_to_f32x2(wv.w);
+#pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) {
+                const float4* xp4 = reinterpret_cast<const float4*>(cat + (size_t)m * D2);
+                const float4 x0 = xp4[2 * i + 0];
+                const float4 x1 = xp4[2 * i + 1];
+                acc[m] = fmaf(w0.x, x0.x, acc[m]); acc[m] = fmaf(w0.y, x0.y, acc[m]);
+                acc[m] = fmaf(w1.x, x0.z, acc[m]); acc[m] = fmaf(w1.y, x0.w, acc[m]);
+                acc[m] = fmaf(w2.x, x1.x, acc[m]); acc[m] = fmaf(w2.y, x1.y, acc[m]);
+                acc[m] = fmaf(w3.x, x1.z, acc[m]); acc[m] = fmaf(w3.y, x1.w, acc[m]);
+            }
+        }
+    }
+    __shared__ float sh[32];
+#pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            float s = block_sum(acc[m], sh);
+            if (tid == 0) gate[(size_t)m * kInkGateRank + r] = s;
+        }
+    }
+}
+
+template <int MAX_M>
+__global__ void __launch_bounds__(256) k_ink_ctrl_apply_smallM_bf16(
+    const float* __restrict__ cur,               // [M, 2304]
+    const float* __restrict__ msg,               // [M, 2304]
+    const float* __restrict__ gate,              // [M, 64]
+    const __nv_bfloat16* __restrict__ w_gain,    // [2304, 64] BF16
+    const __nv_bfloat16* __restrict__ w_forget,  // [2304, 64] BF16
+    float* __restrict__ out,                     // [M, 2304]
+    int M, int D) {
+    __shared__ alignas(16) float s_gate[MAX_M][kInkGateRank];
+    const int tid = threadIdx.x;
+    for (int i = tid; i < M * kInkGateRank; i += 256) s_gate[i >> 6][i & 63] = gate[i];
+    __syncthreads();
+
+    const int sub = tid >> 3;     // 0..31 rows inside CTA
+    const int lg  = tid & 7;      // 0..7 -> 8 floats [8*lg .. 8*lg+7] inside rank-64 row
+    const int d   = blockIdx.x * 32 + sub;
+    if (d >= D) return;
+
+    const uint4 wgv = reinterpret_cast<const uint4*>(w_gain + (size_t)d * kInkGateRank)[lg];
+    const uint4 wfv = reinterpret_cast<const uint4*>(w_forget + (size_t)d * kInkGateRank)[lg];
+    const float2 g0 = bf16x2_to_f32x2(wgv.x), g1 = bf16x2_to_f32x2(wgv.y);
+    const float2 g2 = bf16x2_to_f32x2(wgv.z), g3 = bf16x2_to_f32x2(wgv.w);
+    const float2 f0 = bf16x2_to_f32x2(wfv.x), f1 = bf16x2_to_f32x2(wfv.y);
+    const float2 f2 = bf16x2_to_f32x2(wfv.z), f3 = bf16x2_to_f32x2(wfv.w);
+#pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            const float4* gp4 = reinterpret_cast<const float4*>(s_gate[m]);
+            const float4 x0 = gp4[2 * lg + 0];
+            const float4 x1 = gp4[2 * lg + 1];
+            float ag = g0.x * x0.x + g0.y * x0.y + g1.x * x0.z + g1.y * x0.w
+                     + g2.x * x1.x + g2.y * x1.y + g3.x * x1.z + g3.y * x1.w;
+            float af = f0.x * x0.x + f0.y * x0.y + f1.x * x0.z + f1.y * x0.w
+                     + f2.x * x1.x + f2.y * x1.y + f3.x * x1.z + f3.y * x1.w;
+#pragma unroll
+            for (int o = 4; o >= 1; o >>= 1) {
+                ag += __shfl_xor_sync(0xFFFFFFFFu, ag, o);
+                af += __shfl_xor_sync(0xFFFFFFFFu, af, o);
+            }
+            if (lg == 0) {
+                const size_t idx = (size_t)m * D + d;
+                out[idx] = (1.0f - tanhf(af)) * cur[idx] + tanhf(ag) * msg[idx];
+            }
+        }
+    }
+}
+
+template <int MAX_M>
+__global__ void __launch_bounds__(256) k_ink_ctrl_3x_down_smallM_bf16(
+    const float* __restrict__ cat3,
+    const __nv_bfloat16* __restrict__ wd0, const __nv_bfloat16* __restrict__ wd1, const __nv_bfloat16* __restrict__ wd2,
+    float* __restrict__ gate3,
+    int M, int D2) {
+    const int r = blockIdx.x;
+    const int c = blockIdx.y;
+    if (r >= kInkGateRank || c >= 3) return;
+    const int tid = threadIdx.x;
+    const int D2_8 = D2 >> 3;
+    const __nv_bfloat16* wd = (c == 0) ? wd0 : (c == 1 ? wd1 : wd2);
+    const float* cat = cat3 + (size_t)c * M * D2;
+    const uint4* wr = reinterpret_cast<const uint4*>(wd + (size_t)r * D2);
+    float acc[MAX_M] = {};
+    for (int i = tid; i < D2_8; i += 256) {
+        const uint4 wv = wr[i];
+        const float2 w0 = bf16x2_to_f32x2(wv.x), w1 = bf16x2_to_f32x2(wv.y);
+        const float2 w2 = bf16x2_to_f32x2(wv.z), w3 = bf16x2_to_f32x2(wv.w);
+#pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) {
+                const float4* xp4 = reinterpret_cast<const float4*>(cat + (size_t)m * D2);
+                const float4 x0 = xp4[2 * i + 0];
+                const float4 x1 = xp4[2 * i + 1];
+                acc[m] = fmaf(w0.x, x0.x, acc[m]); acc[m] = fmaf(w0.y, x0.y, acc[m]);
+                acc[m] = fmaf(w1.x, x0.z, acc[m]); acc[m] = fmaf(w1.y, x0.w, acc[m]);
+                acc[m] = fmaf(w2.x, x1.x, acc[m]); acc[m] = fmaf(w2.y, x1.y, acc[m]);
+                acc[m] = fmaf(w3.x, x1.z, acc[m]); acc[m] = fmaf(w3.y, x1.w, acc[m]);
+            }
+        }
+    }
+    __shared__ float sh[32];
+#pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            float s = block_sum(acc[m], sh);
+            if (tid == 0) gate3[((size_t)c * M + m) * kInkGateRank + r] = s;
+        }
+    }
+}
+
+template <int MAX_M>
+__global__ void __launch_bounds__(256) k_ink_ctrl_3x_apply_smallM_bf16(
+    const float* __restrict__ cur0, const float* __restrict__ cur1, const float* __restrict__ cur2,
+    const float* __restrict__ msgs,
+    const float* __restrict__ gate3,
+    const __nv_bfloat16* __restrict__ wg0, const __nv_bfloat16* __restrict__ wg1, const __nv_bfloat16* __restrict__ wg2,
+    const __nv_bfloat16* __restrict__ wf0, const __nv_bfloat16* __restrict__ wf1, const __nv_bfloat16* __restrict__ wf2,
+    float* __restrict__ out0, float* __restrict__ out1, float* __restrict__ out2,
+    int M, int D) {
+    const int c = blockIdx.y;
+    if (c >= 3) return;
+    __shared__ alignas(16) float s_gate[MAX_M][kInkGateRank];
+    const int tid = threadIdx.x;
+    const float* gate = gate3 + (size_t)c * M * kInkGateRank;
+    for (int i = tid; i < M * kInkGateRank; i += 256) s_gate[i >> 6][i & 63] = gate[i];
+    __syncthreads();
+
+    const int sub = tid >> 3;
+    const int lg  = tid & 7;
+    const int d   = blockIdx.x * 32 + sub;
+    if (d >= D) return;
+
+    const float* cur         = (c == 0) ? cur0 : (c == 1 ? cur1 : cur2);
+    const float* msg         = msgs + (size_t)c * M * D;
+    const __nv_bfloat16* wg  = (c == 0) ? wg0 : (c == 1 ? wg1 : wg2);
+    const __nv_bfloat16* wf  = (c == 0) ? wf0 : (c == 1 ? wf1 : wf2);
+    float* out               = (c == 0) ? out0 : (c == 1 ? out1 : out2);
+
+    const uint4 wgv = reinterpret_cast<const uint4*>(wg + (size_t)d * kInkGateRank)[lg];
+    const uint4 wfv = reinterpret_cast<const uint4*>(wf + (size_t)d * kInkGateRank)[lg];
+    const float2 g0 = bf16x2_to_f32x2(wgv.x), g1 = bf16x2_to_f32x2(wgv.y);
+    const float2 g2 = bf16x2_to_f32x2(wgv.z), g3 = bf16x2_to_f32x2(wgv.w);
+    const float2 f0 = bf16x2_to_f32x2(wfv.x), f1 = bf16x2_to_f32x2(wfv.y);
+    const float2 f2 = bf16x2_to_f32x2(wfv.z), f3 = bf16x2_to_f32x2(wfv.w);
+#pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            const float4* gp4 = reinterpret_cast<const float4*>(s_gate[m]);
+            const float4 x0 = gp4[2 * lg + 0];
+            const float4 x1 = gp4[2 * lg + 1];
+            float ag = g0.x * x0.x + g0.y * x0.y + g1.x * x0.z + g1.y * x0.w
+                     + g2.x * x1.x + g2.y * x1.y + g3.x * x1.z + g3.y * x1.w;
+            float af = f0.x * x0.x + f0.y * x0.y + f1.x * x0.z + f1.y * x0.w
+                     + f2.x * x1.x + f2.y * x1.y + f3.x * x1.z + f3.y * x1.w;
+#pragma unroll
+            for (int o = 4; o >= 1; o >>= 1) {
+                ag += __shfl_xor_sync(0xFFFFFFFFu, ag, o);
+                af += __shfl_xor_sync(0xFFFFFFFFu, af, o);
+            }
+            if (lg == 0) {
+                const size_t idx = (size_t)m * D + d;
+                out[idx] = (1.0f - tanhf(af)) * cur[idx] + tanhf(ag) * msg[idx];
+            }
+        }
+    }
+}
+
 __global__ void __launch_bounds__(256) k_ink_rms_norm_3x(
     float* __restrict__ x0, float* __restrict__ x1, float* __restrict__ x2,
     const float* __restrict__ w0, const float* __restrict__ w1, const float* __restrict__ w2,
@@ -542,8 +729,9 @@ __global__ void __launch_bounds__(256) k_ink_attn_res_3x_cat_rms(
     const float* __restrict__ q_msg, // [4, D]
     float* __restrict__ mixed_out,   // [3, M, D] (for is_swa, slot 0..2 all written so ctrl_3x reads uniformly)
     float* __restrict__ msgs_out,    // [4, M, D]
-    float* __restrict__ cat3_out,    // [3, M, 2*D] (only used when cat3_out != nullptr)
-    int M, int D) {
+    float* __restrict__ cat3_out,    // [3, M, 2*D] F32 (or BF16 when cat_bf16=true)
+    int M, int D,
+    bool cat_bf16 = false) {
     const int m = blockIdx.x;
     const int c = blockIdx.y;  // 0..3
     if (m >= M || c >= 4) return;
@@ -635,19 +823,32 @@ __global__ void __launch_bounds__(256) k_ink_attn_res_3x_cat_rms(
         ssc += ax * ax + ay * ay + az * az + aw * aw;
     }
 
-    // 3. Write normalized [rms(src_c); rms(msg_c)] directly into cat3_out (if small-M fused path)!
+    // 3. Write normalized [rms(src_c); rms(msg_c)] directly into cat3_out (F32 or fused BF16 for prefill TC)!
     if (cat3_out) {
         ssc = block_sum(ssc, sh);
         ssm = block_sum(ssm, sh);
         const float ic = rsqrtf(ssc / (float)D + kInkRmsEps);
         const float im = rsqrtf(ssm / (float)D + kInkRmsEps);
-        float* dst = cat3_out + ((size_t)c * M + m) * (2 * D);
-        float4* d0 = reinterpret_cast<float4*>(dst);
-        float4* d1 = reinterpret_cast<float4*>(dst + D);
-        for (int i = tid; i < D4; i += 256) {
-            const float4 sv = sdst4[i], mv = mdst4[i];
-            d0[i] = make_float4(sv.x * ic, sv.y * ic, sv.z * ic, sv.w * ic);
-            d1[i] = make_float4(mv.x * im, mv.y * im, mv.z * im, mv.w * im);
+        if (cat_bf16) {
+            __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(cat3_out) + ((size_t)c * M + m) * (2 * D);
+            __nv_bfloat162* b0 = reinterpret_cast<__nv_bfloat162*>(dst);
+            __nv_bfloat162* b1 = reinterpret_cast<__nv_bfloat162*>(dst + D);
+            for (int i = tid; i < D4; i += 256) {
+                const float4 sv = sdst4[i], mv = mdst4[i];
+                b0[2 * i + 0] = __floats2bfloat162_rn(sv.x * ic, sv.y * ic);
+                b0[2 * i + 1] = __floats2bfloat162_rn(sv.z * ic, sv.w * ic);
+                b1[2 * i + 0] = __floats2bfloat162_rn(mv.x * im, mv.y * im);
+                b1[2 * i + 1] = __floats2bfloat162_rn(mv.z * im, mv.w * im);
+            }
+        } else {
+            float* dst = cat3_out + ((size_t)c * M + m) * (2 * D);
+            float4* d0 = reinterpret_cast<float4*>(dst);
+            float4* d1 = reinterpret_cast<float4*>(dst + D);
+            for (int i = tid; i < D4; i += 256) {
+                const float4 sv = sdst4[i], mv = mdst4[i];
+                d0[i] = make_float4(sv.x * ic, sv.y * ic, sv.z * ic, sv.w * ic);
+                d1[i] = make_float4(mv.x * im, mv.y * im, mv.z * im, mv.w * im);
+            }
         }
     }
 }
@@ -658,8 +859,9 @@ __global__ void __launch_bounds__(256) k_ink_mlp_res_cat_rms(
     const float* __restrict__ q_mlp,  // [D]
     const float* __restrict__ msg_m,  // [M, D] (d_msgs + 3*M*D)
     float* __restrict__ moe_in_out,   // [M, D]
-    float* __restrict__ cat_out,      // [M, 2*D]
-    int M, int D) {
+    float* __restrict__ cat_out,      // [M, 2*D] F32 (or BF16 when cat_bf16=true)
+    int M, int D,
+    bool cat_bf16 = false) {
     const int m = blockIdx.x;
     if (m >= M) return;
     const int tid = threadIdx.x;
@@ -730,12 +932,25 @@ __global__ void __launch_bounds__(256) k_ink_mlp_res_cat_rms(
     ssm = block_sum(ssm, sh);
     const float ic = rsqrtf(ssc / (float)D + kInkRmsEps);
     const float im = rsqrtf(ssm / (float)D + kInkRmsEps);
-    float4* c0 = reinterpret_cast<float4*>(cat_out + (size_t)m * (2 * D));
-    float4* c1 = reinterpret_cast<float4*>(cat_out + (size_t)m * (2 * D) + D);
-    for (int i = tid; i < D4; i += 256) {
-        const float4 sv = dst4[i], mv = mp4[i];
-        c0[i] = make_float4(sv.x * ic, sv.y * ic, sv.z * ic, sv.w * ic);
-        c1[i] = make_float4(mv.x * im, mv.y * im, mv.z * im, mv.w * im);
+    if (cat_bf16) {
+        __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(cat_out) + (size_t)m * (2 * D);
+        __nv_bfloat162* b0 = reinterpret_cast<__nv_bfloat162*>(dst);
+        __nv_bfloat162* b1 = reinterpret_cast<__nv_bfloat162*>(dst + D);
+        for (int i = tid; i < D4; i += 256) {
+            const float4 sv = dst4[i], mv = mp4[i];
+            b0[2 * i + 0] = __floats2bfloat162_rn(sv.x * ic, sv.y * ic);
+            b0[2 * i + 1] = __floats2bfloat162_rn(sv.z * ic, sv.w * ic);
+            b1[2 * i + 0] = __floats2bfloat162_rn(mv.x * im, mv.y * im);
+            b1[2 * i + 1] = __floats2bfloat162_rn(mv.z * im, mv.w * im);
+        }
+    } else {
+        float4* c0 = reinterpret_cast<float4*>(cat_out + (size_t)m * (2 * D));
+        float4* c1 = reinterpret_cast<float4*>(cat_out + (size_t)m * (2 * D) + D);
+        for (int i = tid; i < D4; i += 256) {
+            const float4 sv = dst4[i], mv = mp4[i];
+            c0[i] = make_float4(sv.x * ic, sv.y * ic, sv.z * ic, sv.w * ic);
+            c1[i] = make_float4(mv.x * im, mv.y * im, mv.z * im, mv.w * im);
+        }
     }
 }
 
