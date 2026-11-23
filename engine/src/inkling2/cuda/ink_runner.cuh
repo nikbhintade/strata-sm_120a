@@ -1934,7 +1934,8 @@ struct InkCudaRunner {
                 max_batch = 512;
                 swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
             }
-            if (vfree < (1200ull << 20) && max_batch > 256) {
+            const size_t mb256_thresh = (kv_dtype == InkKvDtype::FP16) ? (1200ull << 20) : (960ull << 20);
+            if (vfree < mb256_thresh && max_batch > 256) {
                 max_batch = 256;
                 swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
             }
@@ -1949,9 +1950,14 @@ struct InkCudaRunner {
             const size_t swa_kv_bytes = (size_t)n_swa_g0 * max_slots * swa_ring * per_visit_pos;
             const size_t sconv_bytes  = (size_t)(n_swa_g0 + n_glob_g0) * max_slots * 3 * kInkSconvCh * 4;
             const size_t wddm_fl = InkCudaModel::wddm_safety_floor(vtot);
-            const size_t ws_reserve = ((max_slots >= 8) ? (1280ull << 20) : (768ull << 20))
-                                    + (m.man.has_dspark ? (256ull << 20) : 0ull)
-                                    + (wddm_fl / 2);
+            const size_t base_ws_res = (max_slots >= 8) ? (1280ull << 20)
+                                     : (vtot <= (18ull << 30) && max_slots == 1)
+                                         ? ((max_batch <= 256) ? (448ull << 20) : (560ull << 20))
+                                         : (768ull << 20);
+            const size_t dspark_ws_res = m.man.has_dspark
+                                       ? ((vtot <= (18ull << 30) && !m.unembed_screen.ready) ? (128ull << 20) : (256ull << 20))
+                                       : 0ull;
+            const size_t ws_reserve = base_ws_res + dspark_ws_res + (wddm_fl / 2);
             const size_t avail_glob = (vfree > swa_kv_bytes + sconv_bytes + ws_reserve)
                 ? (vfree - swa_kv_bytes - sconv_bytes - ws_reserve) : 0u;
             const size_t per_pos_glob = (size_t)std::max(1, n_glob_g0) * max_slots * per_visit_pos
@@ -1980,7 +1986,7 @@ struct InkCudaRunner {
                 kv_host_ctx = 0;
                 kv_alloc_ctx = kv_dev_ctx;
             } else if (kv_offload_mode == 0 && host_fit_ctx >= 256) {
-                int dev_part = (vram_fit_ctx >= 1024) ? ((vram_fit_ctx * 3 / 4) & ~255) : 0;
+                int dev_part = (vram_fit_ctx >= 512) ? ((vram_fit_ctx * 7 / 8) & ~255) : 0;
                 int host_part = std::min(max_ctx - dev_part, host_fit_ctx);
                 if (dev_part + host_part < max_ctx) {
                     max_ctx = std::max(256, dev_part + host_part);
@@ -2138,11 +2144,13 @@ struct InkCudaRunner {
             INK_CK(cudaStreamSynchronize(st));
         }
 
-        d_dot_hat   = dalloc<float>(8ull * kInkVocabUnpad);
-        d_h_norm2   = dalloc<float>(8);
-        d_max_lb    = dalloc<int>(8);
-        d_cand_ids  = dalloc<int32_t>(8ull * 4096);
-        d_cand_cnt  = dalloc<int32_t>(8);
+        if (m.unembed_screen.ready) {
+            d_dot_hat   = dalloc<float>(8ull * kInkVocabUnpad);
+            d_h_norm2   = dalloc<float>(8);
+            d_max_lb    = dalloc<int>(8);
+            d_cand_ids  = dalloc<int32_t>(8ull * 4096);
+            d_cand_cnt  = dalloc<int32_t>(8);
+        }
         d_argmax    = dalloc<int32_t>(std::max(64, max_batch));
 
         d_tok_ids   = dalloc<int32_t>(MB);

@@ -151,6 +151,9 @@ public:
         if (opts.kv_dtype_auto) {
             if (max_slots_ >= 16) {
                 kv_dtype_ = KvDtype::FP8_E4M3;
+            } else if (sm_cc >= 89 && prop.totalGlobalMem <= (18ull << 30)) {
+                // Keep 8K+ Global KV resident in GDDR7 VRAM on 16 GB Ada/Blackwell cards instead of PCIe offload!
+                kv_dtype_ = KvDtype::FP8_E4M3;
             } else if (kv_offload_mode < 0) {
                 if (prop.totalGlobalMem <= (13ull << 30)) {
                     kv_dtype_ = KvDtype::FP8_E4M3;
