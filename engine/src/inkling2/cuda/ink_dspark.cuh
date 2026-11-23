@@ -1450,63 +1450,47 @@ struct InkDSpark {
         r.linear(wn, X, Y, B, -1, reuse_x);
     }
 
-    // Elastic growth for DSpark Global layer(s) (e.g. layer 1) as sequence length grows!
+    // Elastic growth for DSpark Global layer(s) (e.g. layer 1) using per-tensor K-then-V realloc (2x less peak VRAM!)
     bool ensure_ctx_cap(int needed_pos) {
         if (!ready || needed_pos <= 0) return true;
-        const int target = std::min(max_ctx, std::max(needed_pos, ((needed_pos + 8191) / 8192) * 8192));
         bool grew = false;
+        auto realloc_buf = [&](auto*& ptr, size_t old_n, size_t new_n) -> bool {
+            using T = std::remove_reference_t<decltype(*ptr)>;
+            T* np = nullptr;
+            if (cudaMalloc(&np, new_n * sizeof(T)) != cudaSuccess) {
+                (void)cudaGetLastError();
+                return false;
+            }
+            INK_CK(cudaMemcpy(np, ptr, old_n * sizeof(T), cudaMemcpyDeviceToDevice));
+            cudaFree(ptr);
+            ptr = np;
+            return true;
+        };
         for (int il = 0; il < 3; ++il) {
             if (m.man.c.dspark_is_swa[il] != 0) continue;
-            if (target <= ctx_cap[il]) continue;
+            if (needed_pos <= ctx_cap[il]) continue;
+            const int step = std::max(8192, std::min(32768, ctx_cap[il]));
+            const int target = std::min(max_ctx, std::max(needed_pos, ((needed_pos + step - 1) / step) * step));
             INK_CK(cudaStreamSynchronize(r.st));
-            const size_t new_elems = (size_t)target * kInkKVHeads * kInkHeadDim;
+            const size_t old_el = (size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim;
+            const size_t new_el = (size_t)target * kInkKVHeads * kInkHeadDim;
+            bool ok = false;
             if (ctx_glob_fp8) {
-                const size_t old_bytes = (size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim;
-                const size_t new_sc_n  = (size_t)target * kInkKVHeads;
-                const size_t old_sc_b  = (size_t)ctx_cap[il] * kInkKVHeads * sizeof(float);
-                uint8_t *nk = nullptr, *nv = nullptr;
-                float *nks = nullptr, *nvs = nullptr;
-                if (cudaMalloc(&nk, new_elems) != cudaSuccess ||
-                    cudaMalloc(&nv, new_elems) != cudaSuccess ||
-                    cudaMalloc(&nks, new_sc_n * sizeof(float)) != cudaSuccess ||
-                    cudaMalloc(&nvs, new_sc_n * sizeof(float)) != cudaSuccess) {
-                    (void)cudaGetLastError();
-                    if (nk) cudaFree(nk);
-                    if (nv) cudaFree(nv);
-                    if (nks) cudaFree(nks);
-                    if (nvs) cudaFree(nvs);
-                    std::fprintf(stderr, "[InkDSpark] Tight VRAM while growing global FP8 ctx %d -> %d; disabling DSpark gracefully\n",
-                                 ctx_cap[il], target);
-                    ready = false;
-                    return false;
-                }
-                INK_CK(cudaMemcpy(nk, d_ctx_k_f8[il], old_bytes, cudaMemcpyDeviceToDevice));
-                INK_CK(cudaMemcpy(nv, d_ctx_v_f8[il], old_bytes, cudaMemcpyDeviceToDevice));
-                INK_CK(cudaMemcpy(nks, d_ctx_k_sc[il], old_sc_b, cudaMemcpyDeviceToDevice));
-                INK_CK(cudaMemcpy(nvs, d_ctx_v_sc[il], old_sc_b, cudaMemcpyDeviceToDevice));
-                cudaFree(d_ctx_k_f8[il]); cudaFree(d_ctx_v_f8[il]);
-                cudaFree(d_ctx_k_sc[il]); cudaFree(d_ctx_v_sc[il]);
-                d_ctx_k_f8[il] = nk; d_ctx_v_f8[il] = nv;
-                d_ctx_k_sc[il] = nks; d_ctx_v_sc[il] = nvs;
+                const size_t old_sc = (size_t)ctx_cap[il] * kInkKVHeads;
+                const size_t new_sc = (size_t)target * kInkKVHeads;
+                ok = realloc_buf(d_ctx_k_f8[il], old_el, new_el)
+                  && realloc_buf(d_ctx_v_f8[il], old_el, new_el)
+                  && realloc_buf(d_ctx_k_sc[il], old_sc, new_sc)
+                  && realloc_buf(d_ctx_v_sc[il], old_sc, new_sc);
             } else {
-                const size_t old_bytes = (size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim * sizeof(__half);
-                __half *nk = nullptr, *nv = nullptr;
-                if (cudaMalloc(&nk, new_elems * sizeof(__half)) != cudaSuccess ||
-                    cudaMalloc(&nv, new_elems * sizeof(__half)) != cudaSuccess) {
-                    (void)cudaGetLastError();
-                    if (nk) cudaFree(nk);
-                    if (nv) cudaFree(nv);
-                    std::fprintf(stderr, "[InkDSpark] Tight VRAM while growing global ctx %d -> %d; disabling DSpark gracefully\n",
-                                 ctx_cap[il], target);
-                    ready = false;
-                    return false;
-                }
-                INK_CK(cudaMemcpy(nk, d_ctx_k[il], old_bytes, cudaMemcpyDeviceToDevice));
-                INK_CK(cudaMemcpy(nv, d_ctx_v[il], old_bytes, cudaMemcpyDeviceToDevice));
-                cudaFree(d_ctx_k[il]);
-                cudaFree(d_ctx_v[il]);
-                d_ctx_k[il] = nk;
-                d_ctx_v[il] = nv;
+                ok = realloc_buf(d_ctx_k[il], old_el, new_el)
+                  && realloc_buf(d_ctx_v[il], old_el, new_el);
+            }
+            if (!ok) {
+                std::fprintf(stderr, "[InkDSpark] Tight VRAM while growing global %s ctx %d -> %d; disabling DSpark gracefully\n",
+                             ctx_glob_fp8 ? "FP8" : "FP16", ctx_cap[il], target);
+                ready = false;
+                return false;
             }
             ctx_cap[il] = target;
             grew = true;

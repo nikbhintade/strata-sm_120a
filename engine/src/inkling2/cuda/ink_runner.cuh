@@ -2335,16 +2335,20 @@ struct InkCudaRunner {
         }
     }
 
-    // Elastic Global KV Cache Growth: starts compact (4K..8K) and grows in 8K-token chunks up to max_ctx!
+    // Elastic Global KV Cache Growth: starts compact (4K..8K) and grows smoothly up to max_ctx with per-tensor
+    // K-then-V realloc (minimizes temporary peak VRAM to 1 single K buffer -> enables full-VRAM 128K on 16 GB!).
     // Returns false cleanly if VRAM is exhausted (NEVER aborts with exit(3)!).
     bool ensure_global_kv_cap(int needed_pos) {
         if (needed_pos <= kv_alloc_ctx) return true;
         if (needed_pos > max_ctx) return false;
         const int old_cap = kv_alloc_ctx;
-        int new_cap = std::min(max_ctx, std::max(needed_pos, ((old_cap + 8191) / 8192 + 1) * 8192));
+        const int step = std::max(8192, std::min(32768, old_cap));
+        int new_cap = std::min(max_ctx, std::max(needed_pos, ((old_cap + step - 1) / step + 1) * step));
         new_cap = std::min(max_ctx, ((new_cap + 63) & ~63));
 
         const size_t per_pos = kv_bytes_per_visit_pos(kv_dtype);
+        const size_t single_k_per_pos = (kv_dtype == InkKvDtype::FP16)
+            ? ((size_t)kInkKVDim * sizeof(__half)) : (size_t)kInkKVDim;
         for (int s = 0; s < (m.ls_active ? m.n_stages : 1); ++s) {
             int n_glob_s = 0;
             for (int v = 0; v < kInkVisits; ++v) {
@@ -2355,11 +2359,16 @@ struct InkCudaRunner {
             size_t vf = 0, vt = 0;
             const int dev = m.ls_active ? m.stage_gpu[s] : m.primary_gpu;
             if (ink_cuda_mem_info(&vf, &vt, dev) != cudaSuccess) return false;
-            const size_t floor_b = 256ull << 20;
-            const size_t need_b = (size_t)n_glob_s * max_slots * new_cap * per_pos;
+            const size_t floor_b = (vt <= (18ull << 30)) ? (96ull << 20) : (256ull << 20);
+            auto peak_extra_bytes = [&](int cap) -> size_t {
+                const size_t delta_b = (size_t)n_glob_s * max_slots * (size_t)(cap - old_cap) * per_pos;
+                const size_t tmp_k_b = (size_t)max_slots * (size_t)old_cap * single_k_per_pos;
+                return delta_b + tmp_k_b;
+            };
+            const size_t need_b = peak_extra_bytes(new_cap);
             if (vf <= floor_b + need_b) {
                 const int tight_cap = std::min(max_ctx, ((needed_pos + 255) & ~255));
-                const size_t tight_b = (size_t)n_glob_s * max_slots * tight_cap * per_pos;
+                const size_t tight_b = peak_extra_bytes(tight_cap);
                 if (vf <= floor_b + tight_b) {
                     // VRAM cannot grow global KV further: seamlessly spill tail [kv_dev_ctx..new_cap-1] into mapped pinned host RAM!
                     if (kv_offload_mode >= 0 && kv_host_ctx == 0) {
@@ -2429,6 +2438,23 @@ struct InkCudaRunner {
             cudaStreamSynchronize(st);
         }
 
+        auto realloc_1d = [&](auto*& ptr, size_t old_slot_n, size_t new_slot_n, cudaStream_t vst) -> bool {
+            using T = std::remove_reference_t<decltype(*ptr)>;
+            T* np = nullptr;
+            if (cudaMalloc(&np, (size_t)max_slots * new_slot_n * sizeof(T)) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+            for (int sl = 0; sl < max_slots; ++sl) {
+                cudaMemcpyAsync(np + (size_t)sl * new_slot_n, ptr + (size_t)sl * old_slot_n,
+                                old_slot_n * sizeof(T), cudaMemcpyDeviceToDevice, vst);
+            }
+            cudaStreamSynchronize(vst);
+            cudaFree(ptr);
+            ptr = np;
+            return true;
+        };
+
         for (int v = 0; v < kInkVisits; ++v) {
             if (kv_desc[v].is_swa) continue;
             const int ip = ink_visit_phys(v);
@@ -2439,62 +2465,26 @@ struct InkCudaRunner {
 
             const size_t old_slot_el = (size_t)old_cap * kInkKVHeads * kInkHeadDim;
             const size_t new_slot_el = (size_t)new_cap * kInkKVHeads * kInkHeadDim;
-            const size_t new_tot_el  = (size_t)max_slots * new_slot_el;
 
             if (kv_dtype == InkKvDtype::FP16) {
-                __half *nk = nullptr, *nv = nullptr;
-                if (cudaMalloc(&nk, new_tot_el * sizeof(__half)) != cudaSuccess ||
-                    cudaMalloc(&nv, new_tot_el * sizeof(__half)) != cudaSuccess) {
-                    if (nk) cudaFree(nk);
-                    if (nv) cudaFree(nv);
-                    cudaGetLastError();
+                if (!realloc_1d(kv_desc[v].k_f16, old_slot_el, new_slot_el, vst) ||
+                    !realloc_1d(kv_desc[v].v_f16, old_slot_el, new_slot_el, vst)) {
                     cudaSetDevice(m.primary_gpu);
                     return false;
                 }
-                for (int sl = 0; sl < max_slots; ++sl) {
-                    cudaMemcpyAsync(nk + (size_t)sl * new_slot_el, kv_desc[v].k_f16 + (size_t)sl * old_slot_el,
-                                    old_slot_el * sizeof(__half), cudaMemcpyDeviceToDevice, vst);
-                    cudaMemcpyAsync(nv + (size_t)sl * new_slot_el, kv_desc[v].v_f16 + (size_t)sl * old_slot_el,
-                                    old_slot_el * sizeof(__half), cudaMemcpyDeviceToDevice, vst);
-                }
-                cudaStreamSynchronize(vst);
-                cudaFree(kv_desc[v].k_f16);
-                cudaFree(kv_desc[v].v_f16);
-                kv_desc[v].k_f16 = nk;
-                kv_desc[v].v_f16 = nv;
             } else {
                 const bool v4 = (kv_dtype == InkKvDtype::K8V4);
                 const size_t old_v_b = v4 ? (old_slot_el / 2u) : old_slot_el;
                 const size_t new_v_b = v4 ? (new_slot_el / 2u) : new_slot_el;
                 const size_t old_sc  = (size_t)old_cap * kInkKVHeads;
                 const size_t new_sc  = (size_t)new_cap * kInkKVHeads;
-                uint8_t *nk = nullptr, *nv = nullptr;
-                float *nks = nullptr, *nvs = nullptr;
-                if (cudaMalloc(&nk, new_tot_el) != cudaSuccess ||
-                    cudaMalloc(&nv, (size_t)max_slots * new_v_b) != cudaSuccess ||
-                    cudaMalloc(&nks, (size_t)max_slots * new_sc * sizeof(float)) != cudaSuccess ||
-                    cudaMalloc(&nvs, (size_t)max_slots * new_sc * sizeof(float)) != cudaSuccess) {
-                    if (nk) cudaFree(nk); if (nv) cudaFree(nv);
-                    if (nks) cudaFree(nks); if (nvs) cudaFree(nvs);
-                    cudaGetLastError();
+                if (!realloc_1d(kv_desc[v].k_f8, old_slot_el, new_slot_el, vst) ||
+                    !realloc_1d(kv_desc[v].v_f8, old_v_b, new_v_b, vst) ||
+                    !realloc_1d(kv_desc[v].k_sc, old_sc, new_sc, vst) ||
+                    !realloc_1d(kv_desc[v].v_sc, old_sc, new_sc, vst)) {
                     cudaSetDevice(m.primary_gpu);
                     return false;
                 }
-                for (int sl = 0; sl < max_slots; ++sl) {
-                    cudaMemcpyAsync(nk + (size_t)sl * new_slot_el, kv_desc[v].k_f8 + (size_t)sl * old_slot_el,
-                                    old_slot_el, cudaMemcpyDeviceToDevice, vst);
-                    cudaMemcpyAsync(nv + (size_t)sl * new_v_b, kv_desc[v].v_f8 + (size_t)sl * old_v_b,
-                                    old_v_b, cudaMemcpyDeviceToDevice, vst);
-                    cudaMemcpyAsync(nks + (size_t)sl * new_sc, kv_desc[v].k_sc + (size_t)sl * old_sc,
-                                    old_sc * sizeof(float), cudaMemcpyDeviceToDevice, vst);
-                    cudaMemcpyAsync(nvs + (size_t)sl * new_sc, kv_desc[v].v_sc + (size_t)sl * old_sc,
-                                    old_sc * sizeof(float), cudaMemcpyDeviceToDevice, vst);
-                }
-                cudaStreamSynchronize(vst);
-                cudaFree(kv_desc[v].k_f8); cudaFree(kv_desc[v].v_f8);
-                cudaFree(kv_desc[v].k_sc); cudaFree(kv_desc[v].v_sc);
-                kv_desc[v].k_f8 = nk; kv_desc[v].v_f8 = nv;
-                kv_desc[v].k_sc = nks; kv_desc[v].v_sc = nvs;
             }
             kv_desc[v].cap_pos = new_cap;
             kv_desc[v].dev_cap = new_cap;
