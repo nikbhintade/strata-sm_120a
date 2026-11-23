@@ -1001,9 +1001,10 @@ __device__ __forceinline__ void sk_unpack8_lane8(const uint8_t* pl, int g, int l
         w0 = (b0 & 3u) | (((b0 >> 2) & 3u) << 8) | (((b0 >> 4) & 3u) << 16) | (((b0 >> 6) & 3u) << 24);
         w1 = (b1 & 3u) | (((b1 >> 2) & 3u) << 8) | (((b1 >> 4) & 3u) << 16) | (((b1 >> 6) & 3u) << 24);
     } else if constexpr (FMT == FMT_S3_K) {
-        const uint8_t b0 = pl[g * 16 + lane_in_g * 2 + 0];
-        const uint8_t b1 = pl[g * 16 + lane_in_g * 2 + 1];
-        const uint8_t hb = pl[64 + g * 8 + lane_in_g];
+        const uint16_t b01 = ld16_u(pl + g * 16 + lane_in_g * 2);
+        const uint32_t b0 = b01 & 0xFFu;
+        const uint32_t b1 = b01 >> 8;
+        const uint32_t hb = pl[64 + g * 8 + lane_in_g];
         w0 = (b0 & 3u) | (((b0 >> 2) & 3u) << 8) | (((b0 >> 4) & 3u) << 16) | (((b0 >> 6) & 3u) << 24);
         w1 = (b1 & 3u) | (((b1 >> 2) & 3u) << 8) | (((b1 >> 4) & 3u) << 16) | (((b1 >> 6) & 3u) << 24);
         w0 |= ((hb & 1u) << 2) | (((hb >> 1) & 1u) << 10) | (((hb >> 2) & 1u) << 18) | (((hb >> 3) & 1u) << 26);
@@ -2248,18 +2249,21 @@ __device__ __forceinline__ void ink_moe_sk_tc_kloop(
         }
         __syncthreads();
 
-        // 3. Run 2x mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 (k=0..31 and k=32..63)!
+        // 3. Run 2x mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 (k=0..31 and k=32..63) using ldmatrix.m8n8.x4!
         if (on0) {
-            const uint32_t b0_0 = *reinterpret_cast<const uint32_t*>(s_aq[nb0 + g] + 4 * tig);
-            const uint32_t b0_1 = *reinterpret_cast<const uint32_t*>(s_aq[nb0 + g] + 16 + 4 * tig);
-            const uint32_t b0_2 = *reinterpret_cast<const uint32_t*>(s_aq[nb0 + g] + 32 + 4 * tig);
-            const uint32_t b0_3 = *reinterpret_cast<const uint32_t*>(s_aq[nb0 + g] + 48 + 4 * tig);
-            uint32_t b1_0 = 0, b1_1 = 0, b1_2 = 0, b1_3 = 0;
-            if (on1) {
-                b1_0 = *reinterpret_cast<const uint32_t*>(s_aq[nb0 + 8 + g] + 4 * tig);
-                b1_1 = *reinterpret_cast<const uint32_t*>(s_aq[nb0 + 8 + g] + 16 + 4 * tig);
-                b1_2 = *reinterpret_cast<const uint32_t*>(s_aq[nb0 + 8 + g] + 32 + 4 * tig);
-                b1_3 = *reinterpret_cast<const uint32_t*>(s_aq[nb0 + 8 + g] + 48 + 4 * tig);
+            const int lane = tid & 31;
+            const int lm = lane >> 3;
+            const int l8 = lane & 7;
+            const int b_row = nb0 + 8 * (lm >> 1) + l8;
+            const int b_col = 16 * (lm & 1);
+            uint32_t b0_0, b0_1, b1_0, b1_1, b0_2, b0_3, b1_2, b1_3;
+            {
+                const uint32_t addr0 = (uint32_t)__cvta_generic_to_shared(&s_aq[b_row][b_col]);
+                const uint32_t addr1 = (uint32_t)__cvta_generic_to_shared(&s_aq[b_row][b_col + 32]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                             : "=r"(b0_0), "=r"(b0_1), "=r"(b1_0), "=r"(b1_1) : "r"(addr0));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                             : "=r"(b0_2), "=r"(b0_3), "=r"(b1_2), "=r"(b1_3) : "r"(addr1));
             }
             const float xd00 = s_ad[nb0 + 2 * tig + 0], xs00 = s_as[nb0 + 2 * tig + 0];
             const float xd01 = s_ad[nb0 + 2 * tig + 1], xs01 = s_as[nb0 + 2 * tig + 1];
@@ -2268,6 +2272,8 @@ __device__ __forceinline__ void ink_moe_sk_tc_kloop(
             const float xd11 = on1 ? s_ad[nb0 + 8 + 2 * tig + 1] : 0.0f;
             const float xs11 = on1 ? s_as[nb0 + 8 + 2 * tig + 1] : 0.0f;
 
+            const int a_rbase = W_PER_WF * wf + 8 * (lm & 1) + l8;
+            const int a_col   = 16 * (lm >> 1);
 #pragma unroll
             for (int i = 0; i < NI; ++i) {
                 const int wr0 = W_PER_WF * wf + 16 * i + g;
@@ -2275,14 +2281,15 @@ __device__ __forceinline__ void ink_moe_sk_tc_kloop(
                 const float eff0 = s_wsc[wr0];
                 const float eff1 = s_wsc[wr1];
 
-                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(s_wq[wr0] + 4 * tig);
-                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(s_wq[wr1] + 4 * tig);
-                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(s_wq[wr0] + 16 + 4 * tig);
-                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(s_wq[wr1] + 16 + 4 * tig);
-                const uint32_t a4 = *reinterpret_cast<const uint32_t*>(s_wq[wr0] + 32 + 4 * tig);
-                const uint32_t a5 = *reinterpret_cast<const uint32_t*>(s_wq[wr1] + 32 + 4 * tig);
-                const uint32_t a6 = *reinterpret_cast<const uint32_t*>(s_wq[wr0] + 48 + 4 * tig);
-                const uint32_t a7 = *reinterpret_cast<const uint32_t*>(s_wq[wr1] + 48 + 4 * tig);
+                uint32_t a0, a1, a2, a3, a4, a5, a6, a7;
+                {
+                    const uint32_t addr0 = (uint32_t)__cvta_generic_to_shared(&s_wq[a_rbase + 16 * i][a_col]);
+                    const uint32_t addr1 = (uint32_t)__cvta_generic_to_shared(&s_wq[a_rbase + 16 * i][a_col + 32]);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                 : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr0));
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                 : "=r"(a4), "=r"(a5), "=r"(a6), "=r"(a7) : "r"(addr1));
+                }
 
                 int32_t cv[4] = {};
                 mma_m16n8k32_s8(cv, a0, a1, a2, a3, b0_0, b0_1);
@@ -2320,6 +2327,264 @@ __device__ __forceinline__ void ink_moe_sk_tc_kloop(
     }
 }
 
+// Double-buffered, software-pipelined 256-thread INT8 Tensor Core S_K MoE K-loop (sm_80..sm_121).
+// Key optimizations over single-buffered kloop:
+//   - Double-buffered SMEM (33.3 KB -> 2 CTAs/SM) cuts __syncthreads() in half (72 -> 36 in GU, 36 -> 18 in DN).
+//   - Hardware cp.async.cg.shared.global (16B) overlaps Q8_1_G64 activation loads with Tensor Core MMA.
+//   - FMT_S3_K / FMT_S4_K superblock register caching: loads 1 full 102B/134B superblock in 3/4 coalesced LDG.32
+//     bursts once every 4 sub-groups, overlapping SB loads with MMA and eliminating 75% of weight/header LDGs!
+template <bool GU, int TR, int FMT>
+__device__ __forceinline__ void ink_moe_sk_tc_kloop_db(
+    const uint8_t* __restrict__ body,
+    uint64_t dn_off,
+    int fb,
+    int nrows,
+    int tid, int wf, int nb0, int g, int tig,
+    bool on0, bool on1,
+    const InkQ8_1_G64* __restrict__ act_sk,
+    const int32_t* __restrict__ s_row,
+    int8_t (&s_wq)[2][128][80],
+    int8_t (&s_aq)[2][TR][80],
+    float (&s_wsc)[2][128],
+    float (&s_ad)[2][TR],
+    float (&s_as)[2][TR],
+    float (&acc)[(128 / (8 / (TR / 16))) / 16][2][4]) {
+    constexpr int kWR      = 128;
+    constexpr int NG       = GU ? (kInkHidden / 64) : (kInkInter / 64);
+    constexpr int N_WN     = TR / 16;
+    constexpr int N_WF     = 8 / N_WN;
+    constexpr int W_PER_WF = kWR / N_WF;
+    constexpr int NI       = W_PER_WF / 16;
+    constexpr int SB       = ink_sb_bytes(FMT);
+    constexpr float HALF   = ink_sk_half(FMT);
+    constexpr bool HAS_HALF = (FMT != FMT_S8_K && FMT != FMT_S1_5);
+
+    const uint8_t* base_ptr = GU ? (body + kInkInter * 2) : (body + dn_off);
+    constexpr uint32_t gu_row_b  = 9u * (uint32_t)SB;
+    constexpr uint32_t dn_pair_b = 9u * (uint32_t)SB;
+    const int r_in_w   = tid >> 3;  // 0..31 rows per wave
+    const int lg       = tid & 7;   // 0..7 coalesced lanes per row
+    const int lane     = tid & 31;
+    const int grp_base = lane & ~7;
+
+    uint32_t row_off[4];
+#pragma unroll
+    for (int wave = 0; wave < 4; ++wave) {
+        const int row_s = wave * 32 + r_in_w;
+        if constexpr (GU) {
+            const uint32_t phys_row = (uint32_t)(2 * (fb * 64 + 8 * (row_s >> 4) + (row_s & 7)) + ((row_s >> 3) & 1));
+            row_off[wave] = phys_row * gu_row_b;
+        } else {
+            const uint32_t phys_row = (uint32_t)(fb * kWR + row_s);
+            row_off[wave] = (phys_row >> 1) * dn_pair_b;
+        }
+    }
+
+    // Superblock register cache for FMT_S3_K and FMT_S4_K (eliminates 3/4 of weight + header global loads)
+    uint32_t sb_r0[4], sb_r1[4], sb_r2[4], sb_sc4[4];
+    uint32_t sb_r3[FMT == FMT_S4_K ? 4 : 1];
+    float    sb_D[4];
+
+    auto issue_act_async = [&](int target_xg, int dst_buf) {
+        if (tid < nrows * 2) {
+            const int r = tid >> 1;
+            const int h = tid & 1;
+            const InkQ8_1_G64& xb = act_sk[(size_t)s_row[r] * NG + target_xg];
+            const uint32_t d0 = (uint32_t)__cvta_generic_to_shared(s_aq[dst_buf][r] + h * 32 + 0);
+            const uint32_t d1 = (uint32_t)__cvta_generic_to_shared(s_aq[dst_buf][r] + h * 32 + 16);
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(d0), "l"(xb.qs + h * 32 + 0));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(d1), "l"(xb.qs + h * 32 + 16));
+            if (h == 0) {
+                s_ad[dst_buf][r] = xb.d;
+                s_as[dst_buf][r] = xb.s;
+            }
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
+
+    auto load_sb = [&](int target_xg) {
+        if constexpr (FMT == FMT_S3_K || FMT == FMT_S4_K) {
+            const int sub_glob = GU ? target_xg : (target_xg + (r_in_w & 1) * 18);
+            if (target_xg == 0 || (sub_glob & 3) == 0) {
+                const uint32_t sb_off = (uint32_t)(sub_glob >> 2) * (uint32_t)SB;
+#pragma unroll
+                for (int wave = 0; wave < 4; ++wave) {
+                    const uint8_t* blk = base_ptr + (size_t)(row_off[wave] + sb_off);
+                    const uint8_t* pl  = blk + 6;
+                    if constexpr (FMT == FMT_S3_K) {
+                        sb_r0[wave] = ld32_u(pl + lg * 8 + 0);
+                        sb_r1[wave] = ld32_u(pl + lg * 8 + 4);
+                        sb_r2[wave] = ld32_u(pl + 64 + lg * 4);
+                    } else {
+                        sb_r0[wave] = ld32_u(pl + 0  + lg * 4);
+                        sb_r1[wave] = ld32_u(pl + 32 + lg * 4);
+                        sb_r2[wave] = ld32_u(pl + 64 + lg * 4);
+                        sb_r3[wave] = ld32_u(pl + 96 + lg * 4);
+                    }
+                    if (lg == 0) {
+                        sb_D[wave]   = f16_to_f32(ld16_u(blk)) * (1.0f / 255.0f);
+                        sb_sc4[wave] = ld32_u(blk + 2);
+                    }
+                }
+            }
+        }
+    };
+
+    auto unpack_to_smem = [&](int target_xg, int dst_buf) {
+        const int sub_glob = GU ? target_xg : (target_xg + (r_in_w & 1) * 18);
+        const int sg = sub_glob & 3;
+        if constexpr (FMT == FMT_S3_K) {
+            const int src_lane = grp_base + sg * 2 + (lg >> 2);
+            const uint32_t half_sh = (uint32_t)((lg & 1) * 16);
+            const uint32_t byte_sh = (uint32_t)((lg & 3) * 8);
+#pragma unroll
+            for (int wave = 0; wave < 4; ++wave) {
+                const uint32_t t0   = __shfl_sync(0xFFFFFFFFu, sb_r0[wave], src_lane);
+                const uint32_t t1   = __shfl_sync(0xFFFFFFFFu, sb_r1[wave], src_lane);
+                const uint32_t hw   = __shfl_sync(0xFFFFFFFFu, sb_r2[wave], src_lane);
+                const uint32_t lo_w = (lg & 2) ? t1 : t0;
+                const uint32_t b01  = (lo_w >> half_sh) & 0xFFFFu;
+                const uint32_t b0   = b01 & 0xFFu;
+                const uint32_t b1   = b01 >> 8;
+                const uint32_t hb   = (hw >> byte_sh) & 0xFFu;
+                uint32_t w0 = (b0 & 3u) | ((b0 & 0x0Cu) << 6) | ((b0 & 0x30u) << 12) | ((b0 & 0xC0u) << 18);
+                uint32_t w1 = (b1 & 3u) | ((b1 & 0x0Cu) << 6) | ((b1 & 0x30u) << 12) | ((b1 & 0xC0u) << 18);
+                w0 |= ((hb & 1u) << 2) | ((hb & 2u) << 9) | ((hb & 4u) << 16) | ((hb & 8u) << 23);
+                w1 |= ((hb & 16u) >> 2) | ((hb & 32u) << 5) | ((hb & 64u) << 12) | ((hb & 128u) << 19);
+                const int row_s = wave * 32 + r_in_w;
+                uint32_t* d4 = reinterpret_cast<uint32_t*>(s_wq[dst_buf][row_s]);
+                d4[2 * lg + 0] = w0;
+                d4[2 * lg + 1] = w1;
+                if (lg == 0) s_wsc[dst_buf][row_s] = sb_D[wave] * (float)((sb_sc4[wave] >> (sg * 8)) & 0xFFu);
+            }
+        } else if constexpr (FMT == FMT_S4_K) {
+#pragma unroll
+            for (int wave = 0; wave < 4; ++wave) {
+                const uint32_t p4 = (sg == 0) ? sb_r0[wave] : (sg == 1) ? sb_r1[wave] : (sg == 2) ? sb_r2[wave] : sb_r3[wave];
+                const uint32_t w0 = (p4 & 0x0Fu) | ((p4 & 0xF0u) << 4) | ((p4 & 0x0F00u) << 8) | ((p4 & 0xF000u) << 12);
+                const uint32_t hi = p4 >> 16;
+                const uint32_t w1 = (hi & 0x0Fu) | ((hi & 0xF0u) << 4) | ((hi & 0x0F00u) << 8) | ((hi & 0xF000u) << 12);
+                const int row_s = wave * 32 + r_in_w;
+                uint32_t* d4 = reinterpret_cast<uint32_t*>(s_wq[dst_buf][row_s]);
+                d4[2 * lg + 0] = w0;
+                d4[2 * lg + 1] = w1;
+                if (lg == 0) s_wsc[dst_buf][row_s] = sb_D[wave] * (float)((sb_sc4[wave] >> (sg * 8)) & 0xFFu);
+            }
+        } else {
+            const uint32_t sb_off = (uint32_t)(sub_glob >> 2) * (uint32_t)SB;
+#pragma unroll
+            for (int wave = 0; wave < 4; ++wave) {
+                const int row_s = wave * 32 + r_in_w;
+                const uint8_t* blk = base_ptr + (size_t)(row_off[wave] + sb_off);
+                uint32_t w0, w1;
+                sk_unpack8_lane8<FMT>(blk + 6, sg, lg, w0, w1);
+                uint32_t* d4 = reinterpret_cast<uint32_t*>(s_wq[dst_buf][row_s]);
+                d4[2 * lg + 0] = w0;
+                d4[2 * lg + 1] = w1;
+                if (lg == 0) s_wsc[dst_buf][row_s] = f16_to_f32(ld16_u(blk)) * ((float)blk[2 + sg] * (1.0f / 255.0f));
+            }
+        }
+    };
+
+    const int lm      = lane >> 3;
+    const int l8      = lane & 7;
+    const int b_row   = nb0 + 8 * (lm >> 1) + l8;
+    const int b_col   = 16 * (lm & 1);
+    const int a_rbase = W_PER_WF * wf + 8 * (lm & 1) + l8;
+    const int a_col   = 16 * (lm >> 1);
+
+    // Prologue: load stage 0 into buf=0
+    issue_act_async(0, 0);
+    load_sb(0);
+    unpack_to_smem(0, 0);
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+
+    for (int xg = 0; xg < NG; ++xg) {
+        const int buf = xg & 1;
+        const int nxt = buf ^ 1;
+
+        // Overlap next-stage activation cp.async + superblock LDGs with current Tensor Core MMAs!
+        if (xg + 1 < NG) {
+            issue_act_async(xg + 1, nxt);
+            load_sb(xg + 1);
+        }
+
+        if (on0) {
+            uint32_t b0_0, b0_1, b1_0, b1_1, b0_2, b0_3, b1_2, b1_3;
+            {
+                const uint32_t addr0 = (uint32_t)__cvta_generic_to_shared(&s_aq[buf][b_row][b_col]);
+                const uint32_t addr1 = (uint32_t)__cvta_generic_to_shared(&s_aq[buf][b_row][b_col + 32]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                             : "=r"(b0_0), "=r"(b0_1), "=r"(b1_0), "=r"(b1_1) : "r"(addr0));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                             : "=r"(b0_2), "=r"(b0_3), "=r"(b1_2), "=r"(b1_3) : "r"(addr1));
+            }
+            const float xd00 = s_ad[buf][nb0 + 2 * tig + 0], xs00 = s_as[buf][nb0 + 2 * tig + 0];
+            const float xd01 = s_ad[buf][nb0 + 2 * tig + 1], xs01 = s_as[buf][nb0 + 2 * tig + 1];
+            const float xd10 = on1 ? s_ad[buf][nb0 + 8 + 2 * tig + 0] : 0.0f;
+            const float xs10 = on1 ? s_as[buf][nb0 + 8 + 2 * tig + 0] : 0.0f;
+            const float xd11 = on1 ? s_ad[buf][nb0 + 8 + 2 * tig + 1] : 0.0f;
+            const float xs11 = on1 ? s_as[buf][nb0 + 8 + 2 * tig + 1] : 0.0f;
+
+#pragma unroll
+            for (int i = 0; i < NI; ++i) {
+                const int wr0 = W_PER_WF * wf + 16 * i + g;
+                const int wr1 = wr0 + 8;
+                const float eff0 = s_wsc[buf][wr0];
+                const float eff1 = s_wsc[buf][wr1];
+
+                uint32_t a0, a1, a2, a3, a4, a5, a6, a7;
+                {
+                    const uint32_t addr0 = (uint32_t)__cvta_generic_to_shared(&s_wq[buf][a_rbase + 16 * i][a_col]);
+                    const uint32_t addr1 = (uint32_t)__cvta_generic_to_shared(&s_wq[buf][a_rbase + 16 * i][a_col + 32]);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                 : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr0));
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                 : "=r"(a4), "=r"(a5), "=r"(a6), "=r"(a7) : "r"(addr1));
+                }
+
+                int32_t cv[4] = {};
+                mma_m16n8k32_s8(cv, a0, a1, a2, a3, b0_0, b0_1);
+                mma_m16n8k32_s8(cv, a4, a5, a6, a7, b0_2, b0_3);
+                if constexpr (HAS_HALF) {
+                    acc[i][0][0] = fmaf(eff0, xd00 * (float)cv[0] - HALF * xs00, acc[i][0][0]);
+                    acc[i][0][1] = fmaf(eff0, xd01 * (float)cv[1] - HALF * xs01, acc[i][0][1]);
+                    acc[i][0][2] = fmaf(eff1, xd00 * (float)cv[2] - HALF * xs00, acc[i][0][2]);
+                    acc[i][0][3] = fmaf(eff1, xd01 * (float)cv[3] - HALF * xs01, acc[i][0][3]);
+                } else {
+                    acc[i][0][0] = fmaf(eff0, xd00 * (float)cv[0], acc[i][0][0]);
+                    acc[i][0][1] = fmaf(eff0, xd01 * (float)cv[1], acc[i][0][1]);
+                    acc[i][0][2] = fmaf(eff1, xd00 * (float)cv[2], acc[i][0][2]);
+                    acc[i][0][3] = fmaf(eff1, xd01 * (float)cv[3], acc[i][0][3]);
+                }
+                if (on1) {
+                    int32_t dv[4] = {};
+                    mma_m16n8k32_s8(dv, a0, a1, a2, a3, b1_0, b1_1);
+                    mma_m16n8k32_s8(dv, a4, a5, a6, a7, b1_2, b1_3);
+                    if constexpr (HAS_HALF) {
+                        acc[i][1][0] = fmaf(eff0, xd10 * (float)dv[0] - HALF * xs10, acc[i][1][0]);
+                        acc[i][1][1] = fmaf(eff0, xd11 * (float)dv[1] - HALF * xs11, acc[i][1][1]);
+                        acc[i][1][2] = fmaf(eff1, xd10 * (float)dv[2] - HALF * xs10, acc[i][1][2]);
+                        acc[i][1][3] = fmaf(eff1, xd11 * (float)dv[3] - HALF * xs11, acc[i][1][3]);
+                    } else {
+                        acc[i][1][0] = fmaf(eff0, xd10 * (float)dv[0], acc[i][1][0]);
+                        acc[i][1][1] = fmaf(eff0, xd11 * (float)dv[1], acc[i][1][1]);
+                        acc[i][1][2] = fmaf(eff1, xd10 * (float)dv[2], acc[i][1][2]);
+                        acc[i][1][3] = fmaf(eff1, xd11 * (float)dv[3], acc[i][1][3]);
+                    }
+                }
+            }
+        }
+
+        if (xg + 1 < NG) {
+            unpack_to_smem(xg + 1, nxt);
+            asm volatile("cp.async.wait_group 0;\n");
+            __syncthreads();
+        }
+    }
+}
+
 inline int ink_gpu_sm_count() {
     static int s_sms = 0;
     if (s_sms <= 0) {
@@ -2335,7 +2600,7 @@ inline int ink_gpu_sm_count() {
 
 // Per-format specialized S_K INT8 Tensor Core MoE kernel (eliminates 7-way switch bloat + supports TR={16,32,64} + L2 atomicAdd!)
 template <bool GU, int TR, int FMT, bool ATOMIC_OUT = false>
-__global__ void __launch_bounds__(256) k_ink_moe_sk_tc_fmt(
+__global__ void __launch_bounds__(256, 2) k_ink_moe_sk_tc_fmt(
     const uint8_t* __restrict__ sec4_base,
     const InkExpertDev* __restrict__ experts,
     InkMoeTables tb,
@@ -2353,11 +2618,11 @@ __global__ void __launch_bounds__(256) k_ink_moe_sk_tc_fmt(
     constexpr int WSTR     = 80;
     constexpr int ASTR     = 80;
 
-    __shared__ alignas(16) int8_t  s_wq[kWR][WSTR];
-    __shared__ alignas(16) int8_t  s_aq[TR][ASTR];
-    __shared__ float               s_wsc[kWR];
-    __shared__ float               s_ad[TR];
-    __shared__ float               s_as[TR];
+    __shared__ alignas(16) int8_t  s_wq[2][kWR][WSTR];
+    __shared__ alignas(16) int8_t  s_aq[2][TR][ASTR];
+    __shared__ float               s_wsc[2][kWR];
+    __shared__ float               s_ad[2][TR];
+    __shared__ float               s_as[2][TR];
     __shared__ int32_t             s_row[TR];
     __shared__ float               s_rw[TR];
 
@@ -2393,10 +2658,16 @@ __global__ void __launch_bounds__(256) k_ink_moe_sk_tc_fmt(
                 if constexpr (!GU) s_rw[tid] = topk_w[tb.pairs[row0 + tid]];
             } else {
                 s_row[tid] = -1;
-                s_ad[tid] = 0.0f; s_as[tid] = 0.0f;
+                s_ad[0][tid] = 0.0f; s_ad[1][tid] = 0.0f;
+                s_as[0][tid] = 0.0f; s_as[1][tid] = 0.0f;
                 if constexpr (!GU) s_rw[tid] = 0.0f;
-                uint32_t* z = reinterpret_cast<uint32_t*>(s_aq[tid]);
-                for (int k = 0; k < 16; ++k) z[k] = 0u;
+                uint4* z0 = reinterpret_cast<uint4*>(s_aq[0][tid]);
+                uint4* z1 = reinterpret_cast<uint4*>(s_aq[1][tid]);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    z0[k] = make_uint4(0u, 0u, 0u, 0u);
+                    z1[k] = make_uint4(0u, 0u, 0u, 0u);
+                }
             }
         }
         __syncthreads();
@@ -2405,7 +2676,7 @@ __global__ void __launch_bounds__(256) k_ink_moe_sk_tc_fmt(
         const bool on0 = nb0 < nrows;
         const bool on1 = nb0 + 8 < nrows;
 
-        ink_moe_sk_tc_kloop<GU, TR, FMT>(body, ed.dn_off, fb, nrows, tid, wf, nb0, g, tig, on0, on1, act_sk, s_row, s_wq, s_aq, s_wsc, s_ad, s_as, acc);
+        ink_moe_sk_tc_kloop_db<GU, TR, FMT>(body, ed.dn_off, fb, nrows, tid, wf, nb0, g, tig, on0, on1, act_sk, s_row, s_wq, s_aq, s_wsc, s_ad, s_as, acc);
 
         if (on0) {
             if constexpr (GU) {
