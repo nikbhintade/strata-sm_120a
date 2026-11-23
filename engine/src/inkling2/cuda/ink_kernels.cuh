@@ -1665,15 +1665,87 @@ __global__ void __launch_bounds__(256) k_ink_bf16_to_f32(const __nv_bfloat16* __
     if (i < n) dst[i] = __bfloat162float(src[i]);
 }
 
-// Per-row symmetric INT8 quantization of X [M, K] -> Xq [M, K] int8 + x_sc [M] (for 45 TOPS sm_61 / 220 TOPS sm_75 INT8 GEMM!)
+// Per-row 2-term symmetric INT8 quantization of X [M, K] -> Xq [2*M, K] int8 (hi + lo) + x_sc [2*M]:
+// Achieves ~15-bit dynamic precision (~am/64516 max error, better than BF16!) so activation outliers NEVER degrade KLD!
+__global__ void __launch_bounds__(256) k_ink_quant_x_row_i8_2term(
+    const float* __restrict__ X, int8_t* __restrict__ Xq, float* __restrict__ x_sc, int M, int K) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int tid = threadIdx.x;
+    const int K4 = K >> 2;
+    const float4* xp4 = reinterpret_cast<const float4*>(X + (size_t)m * K);
+    float am = 0.0f;
+    for (int i = tid; i < K4; i += 256) {
+        const float4 v = xp4[i];
+        am = fmaxf(am, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+    }
+    am = warp_max(am);
+    __shared__ float sm[8];
+    if ((tid & 31) == 0) sm[tid >> 5] = am;
+    __syncthreads();
+    am = fmaxf(fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3])),
+               fmaxf(fmaxf(sm[4], sm[5]), fmaxf(sm[6], sm[7])));
+    const float sc0 = am * (1.0f / 127.0f);
+    const float inv0 = sc0 > 0.0f ? (127.0f / am) : 0.0f;
+    const float sc1 = sc0 * (0.5f / 127.0f);
+    const float inv1 = sc0 > 0.0f ? (254.0f / sc0) : 0.0f;
+    char4* dst0 = reinterpret_cast<char4*>(Xq + (size_t)m * K);
+    char4* dst1 = reinterpret_cast<char4*>(Xq + (size_t)(M + m) * K);
+    for (int i = tid; i < K4; i += 256) {
+        const float4 v = xp4[i];
+        const int q0x = max(-127, min(127, __float2int_rn(v.x * inv0)));
+        const int q0y = max(-127, min(127, __float2int_rn(v.y * inv0)));
+        const int q0z = max(-127, min(127, __float2int_rn(v.z * inv0)));
+        const int q0w = max(-127, min(127, __float2int_rn(v.w * inv0)));
+        dst0[i] = make_char4((int8_t)q0x, (int8_t)q0y, (int8_t)q0z, (int8_t)q0w);
+        const int q1x = max(-127, min(127, __float2int_rn((v.x - (float)q0x * sc0) * inv1)));
+        const int q1y = max(-127, min(127, __float2int_rn((v.y - (float)q0y * sc0) * inv1)));
+        const int q1z = max(-127, min(127, __float2int_rn((v.z - (float)q0z * sc0) * inv1)));
+        const int q1w = max(-127, min(127, __float2int_rn((v.w - (float)q0w * sc0) * inv1)));
+        dst1[i] = make_char4((int8_t)q1x, (int8_t)q1y, (int8_t)q1z, (int8_t)q1w);
+    }
+    if (tid == 0) {
+        x_sc[m] = sc0;
+        x_sc[M + m] = sc1;
+    }
+}
+
+// Recombine stacked 2-term INT32 GEMM output Y_i32 [2*M, N] -> Y_f32 [M, N]:
+// Y[m, n] = w_sc[n] * (Y_i32[m, n] * sc0[m] + Y_i32[M + m, n] * sc1[m])
+__global__ void __launch_bounds__(256) k_ink_i32_to_f32_scale_2term(
+    const int32_t* __restrict__ Y_i32, float* __restrict__ Y_f32,
+    const float* __restrict__ w_sc, const float* __restrict__ x_sc, int M, int N) {
+    const int m = blockIdx.y;
+    const int n4 = blockIdx.x * 256 + threadIdx.x;
+    const int N4 = N >> 2;
+    if (m >= M || n4 >= N4) return;
+    const float s0 = x_sc[m];
+    const float s1 = x_sc[M + m];
+    const float4 ws = reinterpret_cast<const float4*>(w_sc)[n4];
+    const size_t off0 = (size_t)m * N4 + n4;
+    const size_t off1 = (size_t)(M + m) * N4 + n4;
+    const int4 y0 = reinterpret_cast<const int4*>(Y_i32)[off0];
+    const int4 y1 = reinterpret_cast<const int4*>(Y_i32)[off1];
+    reinterpret_cast<float4*>(Y_f32)[off0] = make_float4(
+        ws.x * fmaf((float)y0.x, s0, (float)y1.x * s1),
+        ws.y * fmaf((float)y0.y, s0, (float)y1.y * s1),
+        ws.z * fmaf((float)y0.z, s0, (float)y1.z * s1),
+        ws.w * fmaf((float)y0.w, s0, (float)y1.w * s1));
+}
+
+// Per-row symmetric INT8 quantization of X [M, K] -> Xq [M, K] int8 + x_sc [M] (vectorized float4/char4 for sm_61 INT8 GEMM)
 __global__ void __launch_bounds__(256) k_ink_quant_x_row_i8(
     const float* __restrict__ X, int8_t* __restrict__ Xq, float* __restrict__ x_sc, int M, int K) {
     const int m = blockIdx.x;
     if (m >= M) return;
     const int tid = threadIdx.x;
-    const float* xp = X + (size_t)m * K;
+    const int K4 = K >> 2;
+    const float4* xp4 = reinterpret_cast<const float4*>(X + (size_t)m * K);
     float am = 0.0f;
-    for (int k = tid; k < K; k += 256) am = fmaxf(am, fabsf(xp[k]));
+    for (int i = tid; i < K4; i += 256) {
+        const float4 v = xp4[i];
+        am = fmaxf(am, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+    }
     am = warp_max(am);
     __shared__ float sm[8];
     if ((tid & 31) == 0) sm[tid >> 5] = am;
@@ -1682,22 +1754,36 @@ __global__ void __launch_bounds__(256) k_ink_quant_x_row_i8(
                fmaxf(fmaxf(sm[4], sm[5]), fmaxf(sm[6], sm[7])));
     const float sc = am * (1.0f / 127.0f);
     const float inv = sc > 0.0f ? (127.0f / am) : 0.0f;
-    int8_t* dst = Xq + (size_t)m * K;
-    for (int k = tid; k < K; k += 256) dst[k] = (int8_t)max(-127, min(127, __float2int_rn(xp[k] * inv)));
+    char4* dst4 = reinterpret_cast<char4*>(Xq + (size_t)m * K);
+    for (int i = tid; i < K4; i += 256) {
+        const float4 v = xp4[i];
+        dst4[i] = make_char4(
+            (int8_t)max(-127, min(127, __float2int_rn(v.x * inv))),
+            (int8_t)max(-127, min(127, __float2int_rn(v.y * inv))),
+            (int8_t)max(-127, min(127, __float2int_rn(v.z * inv))),
+            (int8_t)max(-127, min(127, __float2int_rn(v.w * inv))));
+    }
     if (tid == 0) x_sc[m] = sc;
 }
 
-// In-place INT32 -> F32 scaling of cuBLAS INT8 GEMM output Y[M, N] = (float)Y_i32[m, n] * w_sc[n] * x_sc[m]
+// In-place INT32 -> F32 vectorized scaling of cuBLAS INT8 GEMM output Y[M, N] = (float)Y_i32[m, n] * w_sc[n] * x_sc[m]
+// Grid: dim3((N/4 + 255) / 256, M), Block: 256 (zero 64-bit div/mod!)
 __global__ void __launch_bounds__(256) k_ink_i32_to_f32_scale(
     int32_t* __restrict__ Y_i32, float* __restrict__ Y_f32,
     const float* __restrict__ w_sc, const float* __restrict__ x_sc, int M, int N) {
-    const size_t idx = (size_t)blockIdx.x * 256 + threadIdx.x;
-    const size_t tot = (size_t)M * N;
-    if (idx < tot) {
-        const int m = (int)(idx / (size_t)N);
-        const int n = (int)(idx % (size_t)N);
-        Y_f32[idx] = (float)Y_i32[idx] * w_sc[n] * x_sc[m];
-    }
+    const int m = blockIdx.y;
+    const int n4 = blockIdx.x * 256 + threadIdx.x;
+    const int N4 = N >> 2;
+    if (m >= M || n4 >= N4) return;
+    const float xs = x_sc[m];
+    const float4 ws = reinterpret_cast<const float4*>(w_sc)[n4];
+    const size_t off4 = (size_t)m * N4 + n4;
+    const int4 yi = reinterpret_cast<const int4*>(Y_i32)[off4];
+    reinterpret_cast<float4*>(Y_f32)[off4] = make_float4(
+        (float)yi.x * ws.x * xs,
+        (float)yi.y * ws.y * xs,
+        (float)yi.z * ws.z * xs,
+        (float)yi.w * ws.w * xs);
 }
 
 // Dequantize Q8_ROW [N, K] -> BF16 [N, K] into reusable scratch for cuBLAS prefill

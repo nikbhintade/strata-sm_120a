@@ -2742,12 +2742,37 @@ struct InkCudaRunner {
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             }
         } else if (ti.fmt == FMT_Q8ROW) {
-            if (M > 16 && cur_cc == 61 && (K % 4 == 0) && (N % 4 == 0) && N_override == 0) {
-                int8_t* x_i8 = reinterpret_cast<int8_t*>(d_x_bf16);
-                float*  x_sc = d_ctrl_gain;
-                if (!reuse_x_bf16) {
-                    k_ink_quant_x_row_i8<<<M, 256, 0, st>>>(X, x_i8, x_sc, M, K);
+            const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
+            if (M > 16 && (M % 4 == 0) && cur_cc >= 75 && (K % 4 == 0) && (N % 4 == 0) && N_override == 0 && !exact_fp32_x) {
+                const size_t x_bytes = (((size_t)(2 * M) * K + 255ull) & ~255ull);
+                const size_t y_bytes = (size_t)(2 * M) * N * sizeof(int32_t);
+                if (x_bytes + y_bytes <= cap * sizeof(__nv_bfloat16)) {
+                    uint8_t* scr = reinterpret_cast<uint8_t*>(d_w_scratch);
+                    int8_t*  x_i8  = reinterpret_cast<int8_t*>(scr);
+                    int32_t* y_i32 = reinterpret_cast<int32_t*>(scr + x_bytes);
+                    float*   x_sc  = d_ctrl_gain;
+                    if (!reuse_x_bf16) {
+                        k_ink_quant_x_row_i8_2term<<<M, 256, 0, st>>>(X, x_i8, x_sc, M, K);
+                    }
+                    const float*  w_sc = reinterpret_cast<const float*>(W);
+                    const int8_t* w_i8 = reinterpret_cast<const int8_t*>(W + (size_t)ti.rows() * 4);
+                    const int32_t alpha_i = 1, beta_i = 0;
+                    INK_CUBLAS_CK(cublasGemmEx(
+                        cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        N, 2 * M, K, &alpha_i,
+                        w_i8, CUDA_R_8I, K,
+                        x_i8, CUDA_R_8I, K,
+                        &beta_i, y_i32, CUDA_R_32I, N,
+                        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    dim3 gs(((N >> 2) + 255) / 256, M);
+                    k_ink_i32_to_f32_scale_2term<<<gs, 256, 0, st>>>(y_i32, Y, w_sc, x_sc, M, N);
+                    return;
                 }
+            }
+            if (M > 16 && (M % 4 == 0) && cur_cc == 61 && (K % 4 == 0) && (N % 4 == 0) && N_override == 0 && !exact_fp32_x) {
+                int8_t* x_i8 = reinterpret_cast<int8_t*>(d_w_scratch);
+                float*  x_sc = d_ctrl_gain;
+                k_ink_quant_x_row_i8<<<M, 256, 0, st>>>(X, x_i8, x_sc, M, K);
                 const float*  w_sc = reinterpret_cast<const float*>(W);
                 const int8_t* w_i8 = reinterpret_cast<const int8_t*>(W + (size_t)ti.rows() * 4);
                 const int32_t alpha_i = 1, beta_i = 0;
@@ -2757,14 +2782,12 @@ struct InkCudaRunner {
                     w_i8, CUDA_R_8I, K,
                     x_i8, CUDA_R_8I, K,
                     &beta_i, Y, CUDA_R_32I, N,
-                    CUBLAS_COMPUTE_32I,
-                    (cur_cc >= 75) ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
-                const size_t tot = (size_t)M * N;
-                k_ink_i32_to_f32_scale<<<(tot + 255) / 256, 256, 0, st>>>(
+                    CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+                dim3 gs(((N >> 2) + 255) / 256, M);
+                k_ink_i32_to_f32_scale<<<gs, 256, 0, st>>>(
                     reinterpret_cast<int32_t*>(Y), Y, w_sc, x_sc, M, N);
                 return;
             }
-            const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
             const size_t max_tile = (cur_cc < 70) ? (cap / 3) : cap;
             if (M <= 16 || (size_t)N * K > max_tile) {
                 InkMultiProj mp{};
@@ -2981,12 +3004,13 @@ struct InkCudaRunner {
             linear(p + ".attn.wk_dv.weight", in_k, d_k_raw, M, 0, false, exact_x);
             linear(p + ".attn.wv_dv.weight", in_v, d_v_raw, M, 0, false, exact_x);
         } else {
+            const auto fmt_q = m.tinfo(p + ".attn.wq_du.weight").fmt;
             linear(p + ".attn.wq_du.weight", in_q, d_q, M, 0, false);
-            linear(p + ".attn.wr_du.weight", in_q, d_r, M, 0, true);
-            linear(p + ".attn.gate_attn.weight", in_q, d_gate_attn, M, 0, true);
+            linear(p + ".attn.wr_du.weight", in_q, d_r, M, 0, m.tinfo(p + ".attn.wr_du.weight").fmt == fmt_q);
+            linear(p + ".attn.gate_attn.weight", in_q, d_gate_attn, M, 0, m.tinfo(p + ".attn.gate_attn.weight").fmt == fmt_q);
             linear(p + ".attn.attn_sink_proj.weight", in_q, d_sinks, M, 0, false);
-            linear(p + ".attn.wk_dv.weight", in_k, d_k_raw, M, 0, share_qkv);
-            linear(p + ".attn.wv_dv.weight", in_v, d_v_raw, M, 0, share_qkv);
+            linear(p + ".attn.wk_dv.weight", in_k, d_k_raw, M, 0, share_qkv && m.tinfo(p + ".attn.wk_dv.weight").fmt == fmt_q);
+            linear(p + ".attn.wv_dv.weight", in_v, d_v_raw, M, 0, share_qkv && m.tinfo(p + ".attn.wv_dv.weight").fmt == fmt_q);
         }
 
         // 4. Dynamic K/V ShortConv tap projections on global layers
