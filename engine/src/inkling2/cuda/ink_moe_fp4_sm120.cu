@@ -56,6 +56,16 @@ __device__ __forceinline__ void cp16_async(void* dst_smem, const void* src_glob)
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(d), "l"(src_glob));
 }
 
+__device__ __forceinline__ void cp8_async(void* dst_smem, const void* src_glob) {
+    const uint32_t d = smem_u32(dst_smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(d), "l"(src_glob));
+}
+
+__device__ __forceinline__ void cp4_async(void* dst_smem, const void* src_glob) {
+    const uint32_t d = smem_u32(dst_smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(d), "l"(src_glob));
+}
+
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
 __device__ __forceinline__ void cp_wait0()  { asm volatile("cp.async.wait_group 0;\n"); }
 __device__ __forceinline__ void cp_wait1()  { asm volatile("cp.async.wait_group 1;\n"); }
@@ -85,6 +95,21 @@ __device__ __forceinline__ void mma_mxfp8_m16n8k32(float (&d)[4], const uint32_t
         "%10, {0, 0}, %11, {0, 0};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "r"(sfb));
+}
+
+__device__ __forceinline__ float fast_tanh_f32(float x) {
+    float r;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+__device__ __forceinline__ float situ_fast_f32(float g, float u) {
+    if (!isfinite(g) || !isfinite(u)) return 0.0f;
+    const float gc = fminf(fmaxf(g, -80.0f), 80.0f);
+    const float sig = 1.0f / (1.0f + __expf(-gc));
+    const float ga = kInkSituBeta * fast_tanh_f32(g * (1.0f / kInkSituBeta)) * sig;
+    const float ua = kInkSituLb * fast_tanh_f32(u * (1.0f / kInkSituLb));
+    return ga * ua;
 }
 
 __device__ __forceinline__ uint8_t encode_ue4m3(float x, float& decoded) {
@@ -189,7 +214,7 @@ __global__ void k_quant_act_mx8(const float* __restrict__ x, int64_t nblk,
 // TR=32 (n_wf=4, n_wn=2): 100% warp utilization for M=129..768 prefill (avg 32 tok/expert at M=512)!
 // TR=64 (n_wf=2, n_wn=4): max weight reuse for M>768 prefill!
 template <bool GU, int TR, bool ATOMIC_OUT = false>
-__global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
+__global__ void __launch_bounds__(kNT, 2) k_moe_sf4_tc(
     const uint8_t* __restrict__ sec4_base,
     const InkExpertDev* __restrict__ experts,
     InkMoeTables tb,
@@ -206,15 +231,15 @@ __global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
     constexpr int N_WF     = 8 / N_WN;                     // 8, 4, or 2
     constexpr int W_PER_WF = kWR / N_WF;                   // 16, 32, or 64
     constexpr int NI       = W_PER_WF / 16;                // 1, 2, or 4
+    constexpr int STAGES   = 3;                            // 3-stage fully-async ring buffer -> 1 barrier/stage!
     constexpr size_t W_P_ROW   = ROWS_K / 2;
     constexpr size_t W_S_ROW   = ROWS_K / 16;
     constexpr size_t ACT_ROW_B = (size_t)NS * kAB;
 
-    __shared__ alignas(16) uint8_t s_wqs[2][kWR * kWStride4];
-    __shared__ alignas(16) uint8_t s_aqs[2][TR * kAStride4];
-    __shared__ uint32_t s_wsc[2][kWR];
-    __shared__ uint32_t s_asc[2][TR];
-    __shared__ float    s_agb[2][TR];
+    __shared__ alignas(16) uint8_t s_wqs[STAGES][kWR * kWStride4];
+    __shared__ alignas(16) uint8_t s_aqs[STAGES][TR * kAStride4];
+    __shared__ alignas(16) uint32_t s_wsc[GU ? 2 : STAGES][kWR][GU ? 4 : 1];
+    __shared__ alignas(16) uint2    s_ameta[STAGES][TR];  // .x = asc (uint32), .y = float_as_uint(agb)
     __shared__ int32_t  s_row[TR];
     __shared__ float    s_am[N_WF][TR];
     __shared__ float    s_rw[TR];
@@ -270,10 +295,9 @@ __global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
             } else {
                 s_row[tid] = -1;
                 if constexpr (!GU) s_rw[tid] = 0.0f;
-                s_asc[0][tid] = 0u; s_asc[1][tid] = 0u;
-                s_agb[0][tid] = 0.0f; s_agb[1][tid] = 0.0f;
 #pragma unroll
-                for (int b = 0; b < 2; ++b) {
+                for (int b = 0; b < STAGES; ++b) {
+                    s_ameta[b][tid] = make_uint2(0u, 0u);
                     uint4* z = (uint4*)(s_aqs[b] + tid * kAStride4);
                     z[0] = make_uint4(0u, 0u, 0u, 0u);
                     z[1] = make_uint4(0u, 0u, 0u, 0u);
@@ -284,7 +308,13 @@ __global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
 
         auto issue_stage = [&](int st, int buf) {
             cp16_async(s_wqs[buf] + ur * kWStride4 + 16 * uj, wrow_p + (size_t)st * 32 + 16 * uj);
-            if (uj == 0) s_wsc[buf][ur] = *(const uint32_t*)(wrow_s + (size_t)st * 4);
+            if constexpr (GU) {
+                if (uj == 0 && (st & 3) == 0) {
+                    cp16_async(&s_wsc[(st >> 2) & 1][ur][0], wrow_s + (size_t)st * 4);
+                }
+            } else {
+                if (uj == 0) cp4_async(&s_wsc[buf][ur][0], wrow_s + (size_t)st * 4);
+            }
             if (tid < 2 * TR) {
                 const int r = tid >> 1;
                 const int h = tid & 1;
@@ -296,46 +326,47 @@ __global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
                 const int r = tid - 2 * TR;
                 if (r < nrows) {
                     const uint8_t* ap = act + (size_t)s_row[r] * ACT_ROW_B + (size_t)st * kAB;
-                    const uint2 meta = *(const uint2*)(ap + 32);
-                    s_asc[buf][r] = meta.x;
-                    s_agb[buf][r] = __uint_as_float(meta.y);
+                    cp8_async(&s_ameta[buf][r], ap + 32);
                 }
             }
             cp_commit();
         };
 
         issue_stage(0, 0);
+        issue_stage(1, 1);
 
         float acc[NI][2][4] = {};
         const bool on0 = nb0 < nrows;
         const bool on1 = nb0 + 8 < nrows;
 
+        int buf = 0;
         for (int st = 0; st < NS; ++st) {
-            const int buf = st & 1;
-            const int nxt = buf ^ 1;
-            if (st + 1 < NS) {
-                issue_stage(st + 1, nxt);
-                cp_wait1();
-            } else {
-                cp_wait0();
-            }
+            if (st + 1 < NS) cp_wait1();
+            else             cp_wait0();
             __syncthreads();
+
+            if (st + 2 < NS) {
+                int nxt2 = buf + 2;
+                if (nxt2 >= STAGES) nxt2 -= STAGES;
+                issue_stage(st + 2, nxt2);
+            }
 
             if (on0) {
                 uint32_t bq[4];
                 ldsm4(bq, s_aqs[buf] + b_off);
-                const uint32_t sfb0 = s_asc[buf][nb0 + g];
-                const uint32_t sfb1 = on1 ? s_asc[buf][nb0 + 8 + g] : 0u;
-                const float gb00 = s_agb[buf][nb0 + 2 * tig + 0];
-                const float gb01 = s_agb[buf][nb0 + 2 * tig + 1];
-                const float gb10 = on1 ? s_agb[buf][nb0 + 8 + 2 * tig + 0] : 0.0f;
-                const float gb11 = on1 ? s_agb[buf][nb0 + 8 + 2 * tig + 1] : 0.0f;
+                const uint32_t sfb0 = s_ameta[buf][nb0 + g].x;
+                const uint32_t sfb1 = on1 ? s_ameta[buf][nb0 + 8 + g].x : 0u;
+                const float gb00 = __uint_as_float(s_ameta[buf][nb0 + 2 * tig + 0].y);
+                const float gb01 = __uint_as_float(s_ameta[buf][nb0 + 2 * tig + 1].y);
+                const float gb10 = on1 ? __uint_as_float(s_ameta[buf][nb0 + 8 + 2 * tig + 0].y) : 0.0f;
+                const float gb11 = on1 ? __uint_as_float(s_ameta[buf][nb0 + 8 + 2 * tig + 1].y) : 0.0f;
 
 #pragma unroll
                 for (int i = 0; i < NI; ++i) {
                     uint32_t a[4];
                     ldsm4(a, s_wqs[buf] + a_off + 16 * i * kWStride4);
-                    const uint32_t sfa = s_wsc[buf][W_PER_WF * wf + 16 * i + tidx_a];
+                    const uint32_t sfa = GU ? s_wsc[(st >> 2) & 1][W_PER_WF * wf + 16 * i + tidx_a][st & 3]
+                                            : s_wsc[buf][W_PER_WF * wf + 16 * i + tidx_a][0];
 
                     float d0[4] = {};
                     mma_nvfp4_m16n8k64(d0, a, bq[0], bq[1], sfa, sfb0);
@@ -354,7 +385,7 @@ __global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
                     }
                 }
             }
-            if (st + 1 < NS) __syncthreads();
+            if (++buf == STAGES) buf = 0;
         }
 
         if constexpr (GU) {
@@ -370,7 +401,7 @@ __global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
                         for (int i = 0; i < NI; ++i) {
                             const float gt = acc[i][n][c] * w_outer;
                             const float up = acc[i][n][2 + c] * w_outer;
-                            h_val[n][c][i] = situ_f32(gt, up);
+                            h_val[n][c][i] = situ_fast_f32(gt, up);
                         }
                         float a0 = fabsf(h_val[n][c][0]);
                         if constexpr (NI >= 2) a0 = fmaxf(a0, fabsf(h_val[n][c][1]));
@@ -415,30 +446,30 @@ __global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
                         const float inv1 = (NI == 4 && (g_blk * s1) > 0.0f) ? (1.0f / (g_blk * s1)) : 0.0f;
 
                         // Unconditional __shfl_xor_sync across all 32 lanes (deadlock-free when nrows % 8 != 0)!
-                        float qa[NI], qb[NI];
+                        uint32_t pk[NI];
 #pragma unroll
                         for (int i = 0; i < NI; ++i) {
-                            qa[i] = h_val[n][c][i] * ((i < 2) ? inv0 : inv1);
-                            qb[i] = __shfl_xor_sync(0xFFFFFFFFu, qa[i], 4);
+                            const float qa = h_val[n][c][i] * ((i < 2) ? inv0 : inv1);
+                            const float qb = __shfl_xor_sync(0xFFFFFFFFu, qa, 4);
+                            const uint32_t b0 = (uint32_t)pack_e2m1x2(qa, qb);
+                            const uint32_t b1 = __shfl_xor_sync(0xFFFFFFFFu, b0, 8);
+                            const uint32_t b2 = __shfl_xor_sync(0xFFFFFFFFu, b0, 16);
+                            const uint32_t b3 = __shfl_xor_sync(0xFFFFFFFFu, b1, 16);
+                            pk[i] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
                         }
-                        if (valid) {
+                        if (valid && g == 0) {
                             uint8_t* dst_slot = out_ha + (size_t)(row0 + r) * H_ROW_B + (size_t)fb * kAB;
-                            if ((g & 1) == 0) {
-                                const int bo = (4 * NI) * wf + (g >> 1);
-#pragma unroll
-                                for (int i = 0; i < NI; ++i) dst_slot[bo + 4 * i] = pack_e2m1x2(qa[i], qb[i]);
+                            if constexpr (NI == 4) {
+                                *reinterpret_cast<uint4*>(dst_slot + 16 * wf) = make_uint4(pk[0], pk[1], pk[2], pk[3]);
+                                *reinterpret_cast<uint16_t*>(dst_slot + 32 + 2 * wf) = (uint16_t)((uint32_t)d0 | ((uint32_t)d1 << 8));
+                            } else if constexpr (NI == 2) {
+                                *reinterpret_cast<uint2*>(dst_slot + 8 * wf) = make_uint2(pk[0], pk[1]);
+                                dst_slot[32 + wf] = d0;
+                            } else {
+                                *reinterpret_cast<uint32_t*>(dst_slot + 4 * wf) = pk[0];
+                                if ((wf & 1) == 0) dst_slot[32 + (wf >> 1)] = d0;
                             }
-                            if (g == 0) {
-                                if constexpr (NI == 4) {
-                                    dst_slot[32 + 2 * wf + 0] = d0;
-                                    dst_slot[32 + 2 * wf + 1] = d1;
-                                } else if constexpr (NI == 2) {
-                                    dst_slot[32 + wf] = d0;
-                                } else {
-                                    if ((wf & 1) == 0) dst_slot[32 + (wf >> 1)] = d0;
-                                }
-                                if (wf == 0) *(float*)(dst_slot + 36) = g_blk;
-                            }
+                            if (wf == 0) *(float*)(dst_slot + 36) = g_blk;
                         }
                     }
                 }
@@ -480,7 +511,7 @@ __global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
 
 // ---- Persistent Blackwell sm_120a mxf8f6f4 MoE kernel (TR in {16, 32, 64}; L20..23 MX8 experts, 32-element UE8M0 blocks)
 template <bool GU, int TR, bool ATOMIC_OUT = false>
-__global__ void __launch_bounds__(kNT) k_moe_mx8_tc(
+__global__ void __launch_bounds__(kNT, 2) k_moe_mx8_tc(
     const uint8_t* __restrict__ sec4_base,
     const InkExpertDev* __restrict__ experts,
     InkMoeTables tb,
@@ -499,11 +530,12 @@ __global__ void __launch_bounds__(kNT) k_moe_mx8_tc(
     constexpr int N_WF     = 8 / N_WN;
     constexpr int W_PER_WF = kWR / N_WF;
     constexpr int NI       = W_PER_WF / 16;
+    constexpr int STAGES   = 3;
 
-    __shared__ alignas(16) uint8_t s_wqs[2][kWR * kWStride4];
-    __shared__ alignas(16) uint8_t s_aqs[2][TR * kAStride4];
-    __shared__ uint8_t  s_wsc[2][kWR];
-    __shared__ uint8_t  s_asc[2][TR];
+    __shared__ alignas(16) uint8_t s_wqs[STAGES][kWR * kWStride4];
+    __shared__ alignas(16) uint8_t s_aqs[STAGES][TR * kAStride4];
+    __shared__ uint8_t  s_wsc[STAGES][kWR];
+    __shared__ uint8_t  s_asc[STAGES][TR];
     __shared__ int32_t  s_row[TR];
     __shared__ float    s_am[N_WF][TR];
     __shared__ float    s_rw[TR];
@@ -555,9 +587,9 @@ __global__ void __launch_bounds__(kNT) k_moe_mx8_tc(
             } else {
                 s_row[tid] = -1;
                 if constexpr (!GU) s_rw[tid] = 0.0f;
-                s_asc[0][tid] = 0u; s_asc[1][tid] = 0u;
 #pragma unroll
-                for (int b = 0; b < 2; ++b) {
+                for (int b = 0; b < STAGES; ++b) {
+                    s_asc[b][tid] = 0u;
                     uint4* z = (uint4*)(s_aqs[b] + tid * kAStride4);
                     z[0] = make_uint4(0u, 0u, 0u, 0u);
                     z[1] = make_uint4(0u, 0u, 0u, 0u);
@@ -584,21 +616,23 @@ __global__ void __launch_bounds__(kNT) k_moe_mx8_tc(
         };
 
         issue_stage(0, 0);
+        issue_stage(1, 1);
 
         float acc[NI][2][4] = {};
         const bool on0 = nb0 < nrows;
         const bool on1 = nb0 + 8 < nrows;
 
+        int buf = 0;
         for (int st = 0; st < NS; ++st) {
-            const int buf = st & 1;
-            const int nxt = buf ^ 1;
-            if (st + 1 < NS) {
-                issue_stage(st + 1, nxt);
-                cp_wait1();
-            } else {
-                cp_wait0();
-            }
+            if (st + 1 < NS) cp_wait1();
+            else             cp_wait0();
             __syncthreads();
+
+            if (st + 2 < NS) {
+                int nxt2 = buf + 2;
+                if (nxt2 >= STAGES) nxt2 -= STAGES;
+                issue_stage(st + 2, nxt2);
+            }
 
             if (on0) {
                 uint32_t bq[4];
@@ -614,7 +648,7 @@ __global__ void __launch_bounds__(kNT) k_moe_mx8_tc(
                     if (on1) mma_mxfp8_m16n8k32(acc[i][1], a, bq[2], bq[3], sfa, sfb1);
                 }
             }
-            if (st + 1 < NS) __syncthreads();
+            if (++buf == STAGES) buf = 0;
         }
 
         if constexpr (GU) {
