@@ -116,6 +116,7 @@ int main(int argc, char** argv) {
     InkCudaRunner runner(model);
     runner.use_cuda_graph = use_graph;
     runner.init(parallel, max_ctx, chunk, kvd);
+    chunk = std::min(chunk, runner.max_batch);
 
     InkDSpark dspark(runner);
     if (use_dspark && model.man.has_dspark) dspark.init(runner.max_ctx, 512);
@@ -138,8 +139,9 @@ int main(int argc, char** argv) {
     INK_CK(cudaDeviceSynchronize());
     double t_pp0 = now_s();
     double dt_ingest_s = 0.0;
-    for (int off = 0; off < P; off += chunk) {
-        const int n = std::min(chunk, P - off);
+    const int eff_chunk = std::min(chunk, runner.max_batch);
+    for (int off = 0; off < P; off += eff_chunk) {
+        const int n = std::min(eff_chunk, P - off);
         runner.forward_seq(prompt.data() + off, off, n, 0, dspark.ready);
         if (dspark.ready) {
             if (prof) INK_CK(cudaStreamSynchronize(runner.st));
@@ -156,7 +158,7 @@ int main(int argc, char** argv) {
     if (prof) runner.prof_print("PREFILL", 1);
 
     // Emit first token from last prompt position!
-    const int last_chunk = ((P - 1) % chunk) + 1;
+    const int last_chunk = ((P - 1) % eff_chunk) + 1;
     if (!dump_logits_path.empty()) {
         runner.head_logits_full(last_chunk);
         const int V = model.man.c.vocab_unpadded;
