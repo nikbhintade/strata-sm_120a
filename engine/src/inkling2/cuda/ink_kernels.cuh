@@ -1741,6 +1741,164 @@ __global__ void __launch_bounds__(256) k_ink_sk_to_bf16(const uint8_t* __restric
     dst[(size_t)row * K + col] = __float2bfloat16_rn(v);
 }
 
+// Direct register-dequantized S_K (S5_K / S6_K / S8_K) M=1 exact-FP32 GEMV:
+// Reads weights ONCE in registers (zero BF16 VRAM scratch write, zero cuBLAS tile loop, 0.000000 KLD!).
+// 1 warp (32 lanes) per output row, 4 warps (128 threads) per CTA -> grid = (N + 3) / 4.
+template <int FMT>
+__global__ void __launch_bounds__(128) k_ink_gemv_sk_m1(
+    const uint8_t* __restrict__ raw,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int N,
+    int K) {
+    constexpr int SB = ink_sb_bytes(FMT);
+    constexpr float HALF = ink_sk_half(FMT);
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int row = blockIdx.x * 4 + warp;
+
+    __shared__ alignas(16) float s_x[4096];
+    const bool use_smem = (K <= 4096);
+    if (use_smem) {
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        float4* sx4 = reinterpret_cast<float4*>(s_x);
+        const int K4 = K >> 2;
+        for (int i = tid; i < K4; i += 128) sx4[i] = x4[i];
+        __syncthreads();
+    }
+    if (row >= N) return;
+
+    const float* xptr = use_smem ? s_x : x;
+    const int nsb = K >> 8;
+    const uint8_t* rptr = raw + (size_t)row * (size_t)nsb * SB;
+    const int g = lane >> 3;     // 0..3 (64-elem sub-group)
+    const int lg = lane & 7;     // 0..7 (8-elem chunk inside sub-group)
+    const int in_g = lg * 8;
+
+    float acc = 0.0f;
+    for (int s = 0; s < nsb; ++s) {
+        const uint8_t* blk = rptr + (size_t)s * SB;
+        const float D = f16_to_f32(ld16_u(blk));
+        const float eff = D * ((float)blk[2 + g] * (1.0f / 255.0f));
+        const uint8_t* pl = blk + 6;
+        const float4* xp4 = reinterpret_cast<const float4*>(xptr + s * 256 + g * 64 + in_g);
+        const float4 xv0 = xp4[0];
+        const float4 xv1 = xp4[1];
+
+        float bs = 0.0f;
+        if constexpr (FMT == FMT_S6_K) {
+            const uint32_t p4 = ld32_u(pl + g * 32 + lg * 4);
+            const uint16_t h16 = ld16_u(pl + 128 + g * 16 + lg * 2);
+            const float q0 = (float)(((p4 >>  0) & 0xFu) | (((h16 >>  0) & 3u) << 4)) - HALF;
+            const float q1 = (float)(((p4 >>  4) & 0xFu) | (((h16 >>  2) & 3u) << 4)) - HALF;
+            const float q2 = (float)(((p4 >>  8) & 0xFu) | (((h16 >>  4) & 3u) << 4)) - HALF;
+            const float q3 = (float)(((p4 >> 12) & 0xFu) | (((h16 >>  6) & 3u) << 4)) - HALF;
+            const float q4 = (float)(((p4 >> 16) & 0xFu) | (((h16 >>  8) & 3u) << 4)) - HALF;
+            const float q5 = (float)(((p4 >> 20) & 0xFu) | (((h16 >> 10) & 3u) << 4)) - HALF;
+            const float q6 = (float)(((p4 >> 24) & 0xFu) | (((h16 >> 12) & 3u) << 4)) - HALF;
+            const float q7 = (float)(((p4 >> 28) & 0xFu) | (((h16 >> 14) & 3u) << 4)) - HALF;
+            bs = fmaf(q0, xv0.x, fmaf(q1, xv0.y, fmaf(q2, xv0.z, fmaf(q3, xv0.w,
+                 fmaf(q4, xv1.x, fmaf(q5, xv1.y, fmaf(q6, xv1.z, q7 * xv1.w)))))));
+        } else if constexpr (FMT == FMT_S5_K) {
+            const uint32_t p4 = ld32_u(pl + g * 32 + lg * 4);
+            const uint8_t hb = pl[128 + g * 8 + lg];
+            const float q0 = (float)(((p4 >>  0) & 0xFu) | (((hb >> 0) & 1u) << 4)) - HALF;
+            const float q1 = (float)(((p4 >>  4) & 0xFu) | (((hb >> 1) & 1u) << 4)) - HALF;
+            const float q2 = (float)(((p4 >>  8) & 0xFu) | (((hb >> 2) & 1u) << 4)) - HALF;
+            const float q3 = (float)(((p4 >> 12) & 0xFu) | (((hb >> 3) & 1u) << 4)) - HALF;
+            const float q4 = (float)(((p4 >> 16) & 0xFu) | (((hb >> 4) & 1u) << 4)) - HALF;
+            const float q5 = (float)(((p4 >> 20) & 0xFu) | (((hb >> 5) & 1u) << 4)) - HALF;
+            const float q6 = (float)(((p4 >> 24) & 0xFu) | (((hb >> 6) & 1u) << 4)) - HALF;
+            const float q7 = (float)(((p4 >> 28) & 0xFu) | (((hb >> 7) & 1u) << 4)) - HALF;
+            bs = fmaf(q0, xv0.x, fmaf(q1, xv0.y, fmaf(q2, xv0.z, fmaf(q3, xv0.w,
+                 fmaf(q4, xv1.x, fmaf(q5, xv1.y, fmaf(q6, xv1.z, q7 * xv1.w)))))));
+        } else if constexpr (FMT == FMT_S8_K) {
+            const int8_t* qp = reinterpret_cast<const int8_t*>(pl + g * 64 + in_g);
+            bs = fmaf((float)qp[0], xv0.x, fmaf((float)qp[1], xv0.y, fmaf((float)qp[2], xv0.z, fmaf((float)qp[3], xv0.w,
+                 fmaf((float)qp[4], xv1.x, fmaf((float)qp[5], xv1.y, fmaf((float)qp[6], xv1.z, (float)qp[7] * xv1.w)))))));
+        }
+        acc = fmaf(bs, eff, acc);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
+
+// Direct register-dequantized S_K (S5_K / S6_K / S8_K) Multi-Token DP4A GEMV (M <= MAX_M in {4, 8}):
+// Unpacks each S_K weight superblock ONCE and dots against all M tokens via dp4a_i8!
+// Used for DSpark 7-slot base logits (11.8 ms -> ~1.4 ms!), Verify M=4..8, and S_K dense layers without VRAM scratch!
+template <int FMT, int MAX_M>
+__global__ void __launch_bounds__(128) k_ink_gemv_sk_dp4a(
+    const uint8_t* __restrict__ raw,
+    const InkQ8_1_G64* __restrict__ xq,  // [M, K / 64]
+    float* __restrict__ y,               // [M, N]
+    int M,
+    int N,
+    int K) {
+    constexpr int SB = ink_sb_bytes(FMT);
+    constexpr float HALF = ink_sk_half(FMT);
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int row = blockIdx.x * 4 + warp;
+
+    const int nblk_row = K >> 6;  // K / 64 (36 for K=2304)
+    __shared__ alignas(16) InkQ8_1_G64 s_xq[MAX_M][36];
+    const bool use_smem = (nblk_row <= 36);
+    if (use_smem) {
+        // Copy M * nblk_row * 80 bytes in 16-byte chunks
+        const int tot_u4 = (M * nblk_row * (int)sizeof(InkQ8_1_G64)) >> 4;
+        const uint4* src4 = reinterpret_cast<const uint4*>(xq);
+        uint4* dst4 = reinterpret_cast<uint4*>(&s_xq[0][0]);
+        for (int i = tid; i < tot_u4; i += 128) dst4[i] = src4[i];
+        __syncthreads();
+    }
+    if (row >= N) return;
+
+    const int nsb = K >> 8;
+    const uint8_t* rptr = raw + (size_t)row * (size_t)nsb * SB;
+    const int g = lane >> 3;     // 0..3
+    const int lg = lane & 7;     // 0..7
+    const int in_g = lg * 8;
+
+    float acc[MAX_M] = {};
+    for (int s = 0; s < nsb; ++s) {
+        const uint8_t* blk = rptr + (size_t)s * SB;
+        const float D = f16_to_f32(ld16_u(blk));
+        const float eff = D * ((float)blk[2 + g] * (1.0f / 255.0f));
+        const uint8_t* pl = blk + 6;
+        uint32_t w0, w1;
+        sk_unpack8_lane8<FMT>(pl, g, lg, w0, w1);
+
+        const int blk_idx = s * 4 + g;
+#pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) {
+                const InkQ8_1_G64& xb = use_smem ? s_xq[m][blk_idx] : xq[(size_t)m * nblk_row + blk_idx];
+                const uint2 x2 = *reinterpret_cast<const uint2*>(xb.qs + in_g);
+                int32_t isum = dp4a_i8(w1, x2.y, dp4a_i8(w0, x2.x, 0));
+#pragma unroll
+                for (int o = 4; o >= 1; o >>= 1) isum += __shfl_xor_sync(0xFFFFFFFFu, isum, o);
+                if (lg == 0) {
+                    if constexpr (FMT == FMT_S8_K) {
+                        acc[m] = fmaf(eff, xb.d * (float)isum, acc[m]);
+                    } else {
+                        acc[m] = fmaf(eff, xb.d * (float)isum - HALF * xb.s, acc[m]);
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            acc[m] += __shfl_xor_sync(0xFFFFFFFFu, acc[m], 8);
+            acc[m] += __shfl_xor_sync(0xFFFFFFFFu, acc[m], 16);
+            if (lane == 0) y[(size_t)m * N + row] = acc[m];
+        }
+    }
+}
+
 // ============================================================================
 // 7. Exact 2-Stage Cauchy-Schwarz Screened Unembed (0.25 ms on RTX 5090, 100.000% Bit-Exact Argmax!)
 //    Coarse plane: symmetric INT8 per-row quantized unembed [V, 2304] (460 MB) + per-row scale sc[V] + exact L2 error eps[V]!

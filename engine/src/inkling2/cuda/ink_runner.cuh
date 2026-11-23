@@ -2788,6 +2788,30 @@ struct InkCudaRunner {
                 gemm_bf16_compat(w_dst, X, Y, M, N, K, N, reuse_x_bf16, true);
             }
         } else {
+            if (M <= 8 && (K % 256) == 0 && (ti.fmt == FMT_S5_K || ti.fmt == FMT_S6_K || ti.fmt == FMT_S8_K)) {
+                const int grid = (N + 3) / 4;
+                if (M == 1) {
+                    if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_m1<FMT_S5_K><<<grid, 128, 0, st>>>(W, X, Y, N, K);
+                    else if (ti.fmt == FMT_S6_K) k_ink_gemv_sk_m1<FMT_S6_K><<<grid, 128, 0, st>>>(W, X, Y, N, K);
+                    else                         k_ink_gemv_sk_m1<FMT_S8_K><<<grid, 128, 0, st>>>(W, X, Y, N, K);
+                    return;
+                }
+                const int nblk = M * (K / 64);
+                const size_t xq_cap = (size_t)cur_moe_ws->cap_M * (kInkHidden / 64);
+                if ((cur_cc == 61 || cur_cc >= 75) && (size_t)nblk <= xq_cap) {
+                    k_ink_quant_q8_1<<<(nblk + 7) / 8, 256, 0, st>>>(X, cur_moe_ws->xq_sk, M, K);
+                    if (M <= 4) {
+                        if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_dp4a<FMT_S5_K, 4><<<grid, 128, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
+                        else if (ti.fmt == FMT_S6_K) k_ink_gemv_sk_dp4a<FMT_S6_K, 4><<<grid, 128, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
+                        else                         k_ink_gemv_sk_dp4a<FMT_S8_K, 4><<<grid, 128, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
+                    } else {
+                        if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_dp4a<FMT_S5_K, 8><<<grid, 128, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
+                        else if (ti.fmt == FMT_S6_K) k_ink_gemv_sk_dp4a<FMT_S6_K, 8><<<grid, 128, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
+                        else                         k_ink_gemv_sk_dp4a<FMT_S8_K, 8><<<grid, 128, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
+                    }
+                    return;
+                }
+            }
             const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
             const size_t max_tile = (cur_cc < 70) ? (cap / 3) : cap;
             const int tile_n = std::min(N, (int)(max_tile / (size_t)K));
