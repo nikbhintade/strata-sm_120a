@@ -188,7 +188,7 @@ __global__ void k_quant_act_mx8(const float* __restrict__ x, int64_t nblk,
 // TR=16 (n_wf=8, n_wn=1): 100% warp utilization for c=16..128 batched decode!
 // TR=32 (n_wf=4, n_wn=2): 100% warp utilization for M=129..768 prefill (avg 32 tok/expert at M=512)!
 // TR=64 (n_wf=2, n_wn=4): max weight reuse for M>768 prefill!
-template <bool GU, int TR>
+template <bool GU, int TR, bool ATOMIC_OUT = false>
 __global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
     const uint8_t* __restrict__ sec4_base,
     const InkExpertDev* __restrict__ experts,
@@ -453,11 +453,20 @@ __global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
                     const int r = nb0 + 8 * n + 2 * tig + c;
                     if (r < nrows) {
                         const float sc = w_outer * s_rw[r];
-                        float* dst = y_pair + (size_t)tb.pairs[row0 + r] * kHidden;
+                        if constexpr (ATOMIC_OUT) {
+                            float* dst = y_pair + (size_t)tb.tok_idx[row0 + r] * kHidden;
 #pragma unroll
-                        for (int i = 0; i < NI; ++i) {
-                            dst[rbase + 16 * i + g + 0] = acc[i][n][c] * sc;
-                            dst[rbase + 16 * i + g + 8] = acc[i][n][2 + c] * sc;
+                            for (int i = 0; i < NI; ++i) {
+                                atomicAdd(&dst[rbase + 16 * i + g + 0], acc[i][n][c] * sc);
+                                atomicAdd(&dst[rbase + 16 * i + g + 8], acc[i][n][2 + c] * sc);
+                            }
+                        } else {
+                            float* dst = y_pair + (size_t)tb.pairs[row0 + r] * kHidden;
+#pragma unroll
+                            for (int i = 0; i < NI; ++i) {
+                                dst[rbase + 16 * i + g + 0] = acc[i][n][c] * sc;
+                                dst[rbase + 16 * i + g + 8] = acc[i][n][2 + c] * sc;
+                            }
                         }
                     }
                 }
@@ -470,7 +479,7 @@ __global__ void __launch_bounds__(kNT) k_moe_sf4_tc(
 }
 
 // ---- Persistent Blackwell sm_120a mxf8f6f4 MoE kernel (TR in {16, 32, 64}; L20..23 MX8 experts, 32-element UE8M0 blocks)
-template <bool GU, int TR>
+template <bool GU, int TR, bool ATOMIC_OUT = false>
 __global__ void __launch_bounds__(kNT) k_moe_mx8_tc(
     const uint8_t* __restrict__ sec4_base,
     const InkExpertDev* __restrict__ experts,
@@ -671,11 +680,20 @@ __global__ void __launch_bounds__(kNT) k_moe_mx8_tc(
                     const int r = nb0 + 8 * n + 2 * tig + c;
                     if (r < nrows) {
                         const float sc = s_rw[r];
-                        float* dst = y_pair + (size_t)tb.pairs[row0 + r] * kHidden;
+                        if constexpr (ATOMIC_OUT) {
+                            float* dst = y_pair + (size_t)tb.tok_idx[row0 + r] * kHidden;
 #pragma unroll
-                        for (int i = 0; i < NI; ++i) {
-                            dst[rbase + 16 * i + g + 0] = acc[i][n][c] * sc;
-                            dst[rbase + 16 * i + g + 8] = acc[i][n][2 + c] * sc;
+                            for (int i = 0; i < NI; ++i) {
+                                atomicAdd(&dst[rbase + 16 * i + g + 0], acc[i][n][c] * sc);
+                                atomicAdd(&dst[rbase + 16 * i + g + 8], acc[i][n][2 + c] * sc);
+                            }
+                        } else {
+                            float* dst = y_pair + (size_t)tb.pairs[row0 + r] * kHidden;
+#pragma unroll
+                            for (int i = 0; i < NI; ++i) {
+                                dst[rbase + 16 * i + g + 0] = acc[i][n][c] * sc;
+                                dst[rbase + 16 * i + g + 8] = acc[i][n][2 + c] * sc;
+                            }
                         }
                     }
                 }
@@ -951,38 +969,66 @@ void quantize_act_mx8(const float* x, int rows, int cols, uint8_t* xq, uint8_t* 
     k_quant_act_mx8<<<blocks, 256, 0, stream>>>(x, nblk, xq, xsc);
 }
 
+static unsigned persistent_grid(int max_tiles, int nfb) {
+    static int s_sms = 0;
+    if (s_sms <= 0) {
+        int dev = 0;
+        cudaDeviceProp p{};
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
+            s_sms = p.multiProcessorCount;
+        }
+        if (s_sms <= 0) s_sms = 36;
+    }
+    const int cap = std::min(2048, s_sms * 8);
+    return (unsigned)std::min(std::max(1, max_tiles * nfb), cap);
+}
+
 void moe_sf4_gu_tc(const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
                    const uint8_t* xa, uint8_t* ha, int max_tiles, int tile_rows, cudaStream_t stream) {
-    const unsigned grid = (unsigned)std::min(std::max(1, max_tiles * (2 * kInter / kWR)), 2048);
-    if (tile_rows <= 16)      k_moe_sf4_tc<true, 16><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xa, ha, nullptr, nullptr);
-    else if (tile_rows <= 32) k_moe_sf4_tc<true, 32><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xa, ha, nullptr, nullptr);
-    else                      k_moe_sf4_tc<true, 64><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xa, ha, nullptr, nullptr);
+    const unsigned grid = persistent_grid(max_tiles, 2 * kInter / kWR);
+    if (tile_rows <= 16)      k_moe_sf4_tc<true, 16, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xa, ha, nullptr, nullptr);
+    else if (tile_rows <= 32) k_moe_sf4_tc<true, 32, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xa, ha, nullptr, nullptr);
+    else                      k_moe_sf4_tc<true, 64, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xa, ha, nullptr, nullptr);
 }
 
 void moe_sf4_dn_tc(const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
-                   const uint8_t* ha, const float* topk_w, float* y_pair, int max_tiles, int tile_rows, cudaStream_t stream) {
-    const unsigned grid = (unsigned)std::min(std::max(1, max_tiles * (kHidden / kWR)), 2048);
-    if (tile_rows <= 16)      k_moe_sf4_tc<false, 16><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, ha, nullptr, topk_w, y_pair);
-    else if (tile_rows <= 32) k_moe_sf4_tc<false, 32><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, ha, nullptr, topk_w, y_pair);
-    else                      k_moe_sf4_tc<false, 64><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, ha, nullptr, topk_w, y_pair);
+                   const uint8_t* ha, const float* topk_w, float* y_pair, int max_tiles, int tile_rows, cudaStream_t stream,
+                   bool atomic_out) {
+    const unsigned grid = persistent_grid(max_tiles, kHidden / kWR);
+    if (atomic_out) {
+        if (tile_rows <= 16)      k_moe_sf4_tc<false, 16, true><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, ha, nullptr, topk_w, y_pair);
+        else if (tile_rows <= 32) k_moe_sf4_tc<false, 32, true><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, ha, nullptr, topk_w, y_pair);
+        else                      k_moe_sf4_tc<false, 64, true><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, ha, nullptr, topk_w, y_pair);
+    } else {
+        if (tile_rows <= 16)      k_moe_sf4_tc<false, 16, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, ha, nullptr, topk_w, y_pair);
+        else if (tile_rows <= 32) k_moe_sf4_tc<false, 32, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, ha, nullptr, topk_w, y_pair);
+        else                      k_moe_sf4_tc<false, 64, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, ha, nullptr, topk_w, y_pair);
+    }
 }
 
 void moe_mx8_gu_tc(const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
                    const uint8_t* xq, const uint8_t* xsc, uint8_t* hq, uint8_t* hsc,
                    int max_tiles, int tile_rows, cudaStream_t stream) {
-    const unsigned grid = (unsigned)std::min(std::max(1, max_tiles * (2 * kInter / kWR)), 2048);
-    if (tile_rows <= 16)      k_moe_mx8_tc<true, 16><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xq, xsc, hq, hsc, nullptr, nullptr);
-    else if (tile_rows <= 32) k_moe_mx8_tc<true, 32><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xq, xsc, hq, hsc, nullptr, nullptr);
-    else                      k_moe_mx8_tc<true, 64><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xq, xsc, hq, hsc, nullptr, nullptr);
+    const unsigned grid = persistent_grid(max_tiles, 2 * kInter / kWR);
+    if (tile_rows <= 16)      k_moe_mx8_tc<true, 16, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xq, xsc, hq, hsc, nullptr, nullptr);
+    else if (tile_rows <= 32) k_moe_mx8_tc<true, 32, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xq, xsc, hq, hsc, nullptr, nullptr);
+    else                      k_moe_mx8_tc<true, 64, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, xq, xsc, hq, hsc, nullptr, nullptr);
 }
 
 void moe_mx8_dn_tc(const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
                    const uint8_t* hq, const uint8_t* hsc, const float* topk_w, float* y_pair,
-                   int max_tiles, int tile_rows, cudaStream_t stream) {
-    const unsigned grid = (unsigned)std::min(std::max(1, max_tiles * (kHidden / kWR)), 2048);
-    if (tile_rows <= 16)      k_moe_mx8_tc<false, 16><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, hq, hsc, nullptr, nullptr, topk_w, y_pair);
-    else if (tile_rows <= 32) k_moe_mx8_tc<false, 32><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, hq, hsc, nullptr, nullptr, topk_w, y_pair);
-    else                      k_moe_mx8_tc<false, 64><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, hq, hsc, nullptr, nullptr, topk_w, y_pair);
+                   int max_tiles, int tile_rows, cudaStream_t stream,
+                   bool atomic_out) {
+    const unsigned grid = persistent_grid(max_tiles, kHidden / kWR);
+    if (atomic_out) {
+        if (tile_rows <= 16)      k_moe_mx8_tc<false, 16, true><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, hq, hsc, nullptr, nullptr, topk_w, y_pair);
+        else if (tile_rows <= 32) k_moe_mx8_tc<false, 32, true><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, hq, hsc, nullptr, nullptr, topk_w, y_pair);
+        else                      k_moe_mx8_tc<false, 64, true><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, hq, hsc, nullptr, nullptr, topk_w, y_pair);
+    } else {
+        if (tile_rows <= 16)      k_moe_mx8_tc<false, 16, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, hq, hsc, nullptr, nullptr, topk_w, y_pair);
+        else if (tile_rows <= 32) k_moe_mx8_tc<false, 32, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, hq, hsc, nullptr, nullptr, topk_w, y_pair);
+        else                      k_moe_mx8_tc<false, 64, false><<<grid, kNT, 0, stream>>>(sec4_base, experts, tb, hq, hsc, nullptr, nullptr, topk_w, y_pair);
+    }
 }
 
 void test_sf4_gemm_tc(const uint8_t* w_u8, const uint8_t* w_sc, float w_outer,

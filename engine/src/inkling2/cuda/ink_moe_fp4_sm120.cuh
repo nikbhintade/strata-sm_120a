@@ -53,8 +53,10 @@ void moe_sf4_gu_tc(const uint8_t* sec4_base, const InkExpertDev* experts, InkMoe
                    const uint8_t* xa, uint8_t* ha, int max_tiles, int tile_rows, cudaStream_t stream);
 
 /// Blackwell sm_120a native mxf4nvf4 Down projection (for SF4 experts, L0..19).
+/// When atomic_out=true, accumulates weighted outputs directly into y_pair as y_out[M, 2304] via atomicAdd (zero y_pair round-trip!).
 void moe_sf4_dn_tc(const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
-                   const uint8_t* ha, const float* topk_w, float* y_pair, int max_tiles, int tile_rows, cudaStream_t stream);
+                   const uint8_t* ha, const float* topk_w, float* y_pair, int max_tiles, int tile_rows, cudaStream_t stream,
+                   bool atomic_out = false);
 
 /// Blackwell sm_120a native mxf8f6f4 fused Gate+Up+SITU(4.0, 25.0)+MX8-requant (for MX8 experts, L20..23).
 void moe_mx8_gu_tc(const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
@@ -64,7 +66,8 @@ void moe_mx8_gu_tc(const uint8_t* sec4_base, const InkExpertDev* experts, InkMoe
 /// Blackwell sm_120a native mxf8f6f4 Down projection (for MX8 experts, L20..23).
 void moe_mx8_dn_tc(const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
                    const uint8_t* hq, const uint8_t* hsc, const float* topk_w, float* y_pair,
-                   int max_tiles, int tile_rows, cudaStream_t stream);
+                   int max_tiles, int tile_rows, cudaStream_t stream,
+                   bool atomic_out = false);
 
 /// Standalone single-expert GEMM test entry points (used by ink_kernel_test for FP64 parity & TFLOPS benchmarking).
 void test_sf4_gemm_tc(const uint8_t* w_u8, const uint8_t* w_sc, float w_outer,

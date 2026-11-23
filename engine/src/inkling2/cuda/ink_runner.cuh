@@ -1998,7 +1998,7 @@ struct InkCudaRunner {
             const size_t base_ws_res = (max_slots >= 8) ? (1280ull << 20)
                                      : (vtot <= (18ull << 30) && max_slots == 1)
                                          ? ((m.sm_cc >= 80)
-                                             ? ((max_batch <= 256) ? (288ull << 20) : (400ull << 20))
+                                             ? ((max_batch <= 256) ? (256ull << 20) : (368ull << 20))
                                              : ((max_batch <= 256) ? (448ull << 20) : (560ull << 20)))
                                          : (768ull << 20);
             const size_t dspark_ws_res = m.man.has_dspark
@@ -2219,7 +2219,9 @@ struct InkCudaRunner {
         meta_ring_idx = 0;
         h_meta_pin  = halloc_pinned<int32_t>(64ull * meta_ring_stride);
 
-        moe_ws.alloc(max_batch);
+        const int y_pair_cap = (!m.ep2_active && !m.hybrid.active && !m.ls_active && m.sm_cc >= 80 && sm120::available() && max_slots <= 16)
+                             ? std::min(max_batch, 32) : max_batch;
+        moe_ws.alloc(max_batch, y_pair_cap);
         // Pre-allocate O(1)-VRAM Tensor Core prefill attention workspace (~114 MiB) only for pre-Ampere GPUs
         // (sm_80+ uses zero-VRAM fused FlashAttention-2 GQA-3 kernel k_ink_fa2_gqa_prefill!)
         if (m.sm_cc >= 60 && m.sm_cc < 80 && max_slots <= 4 && max_batch >= 128) {
@@ -2937,7 +2939,7 @@ struct InkCudaRunner {
                 gemm_bf16_compat(w_dst, X, Y, M, N, K, N, reuse_x_bf16, true);
             }
         } else {
-            if (M <= 8 && (K % 256) == 0 && (ti.fmt == FMT_S5_K || ti.fmt == FMT_S6_K || ti.fmt == FMT_S8_K)) {
+            if (M <= 16 && (K % 256) == 0 && (ti.fmt == FMT_S5_K || ti.fmt == FMT_S6_K || ti.fmt == FMT_S8_K)) {
                 const int grid = (N + 7) / 8;
                 if (M == 1) {
                     if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_m1<FMT_S5_K><<<grid, 256, 0, st>>>(W, X, Y, N, K);
@@ -2951,22 +2953,27 @@ struct InkCudaRunner {
                     if (!reuse_x_bf16) {
                         k_ink_quant_q8_1<<<(nblk + 7) / 8, 256, 0, st>>>(X, cur_moe_ws->xq_sk, M, K);
                     }
-                    if (M == 8) {
-                        if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_dp4a<FMT_S5_K, 8, true><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
-                        else if (ti.fmt == FMT_S6_K) k_ink_gemv_sk_dp4a<FMT_S6_K, 8, true><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
-                        else                         k_ink_gemv_sk_dp4a<FMT_S8_K, 8, true><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
-                    } else if (M == 7) {
-                        if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_dp4a<FMT_S5_K, 7, true><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
-                        else if (ti.fmt == FMT_S6_K) k_ink_gemv_sk_dp4a<FMT_S6_K, 7, true><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
-                        else                         k_ink_gemv_sk_dp4a<FMT_S8_K, 7, true><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
-                    } else if (M <= 4) {
-                        if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_dp4a<FMT_S5_K, 4, false><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
-                        else if (ti.fmt == FMT_S6_K) k_ink_gemv_sk_dp4a<FMT_S6_K, 4, false><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
-                        else                         k_ink_gemv_sk_dp4a<FMT_S8_K, 4, false><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
-                    } else {
-                        if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_dp4a<FMT_S5_K, 8, false><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
-                        else if (ti.fmt == FMT_S6_K) k_ink_gemv_sk_dp4a<FMT_S6_K, 8, false><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
-                        else                         k_ink_gemv_sk_dp4a<FMT_S8_K, 8, false><<<grid, 256, 0, st>>>(W, cur_moe_ws->xq_sk, Y, M, N, K);
+                    for (int m0 = 0; m0 < M; m0 += 8) {
+                        const int mc = std::min(8, M - m0);
+                        const InkQ8_1_G64* xq_sub = cur_moe_ws->xq_sk + (size_t)m0 * (K / 64);
+                        float* y_sub = Y + (size_t)m0 * N;
+                        if (mc == 8) {
+                            if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_dp4a<FMT_S5_K, 8, true><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                            else if (ti.fmt == FMT_S6_K) k_ink_gemv_sk_dp4a<FMT_S6_K, 8, true><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                            else                         k_ink_gemv_sk_dp4a<FMT_S8_K, 8, true><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                        } else if (mc == 7) {
+                            if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_dp4a<FMT_S5_K, 7, true><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                            else if (ti.fmt == FMT_S6_K) k_ink_gemv_sk_dp4a<FMT_S6_K, 7, true><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                            else                         k_ink_gemv_sk_dp4a<FMT_S8_K, 7, true><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                        } else if (mc <= 4) {
+                            if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_dp4a<FMT_S5_K, 4, false><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                            else if (ti.fmt == FMT_S6_K) k_ink_gemv_sk_dp4a<FMT_S6_K, 4, false><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                            else                         k_ink_gemv_sk_dp4a<FMT_S8_K, 4, false><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                        } else {
+                            if (ti.fmt == FMT_S5_K)      k_ink_gemv_sk_dp4a<FMT_S5_K, 8, false><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                            else if (ti.fmt == FMT_S6_K) k_ink_gemv_sk_dp4a<FMT_S6_K, 8, false><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                            else                         k_ink_gemv_sk_dp4a<FMT_S8_K, 8, false><<<grid, 256, 0, st>>>(W, xq_sub, y_sub, mc, N, K);
+                        }
                     }
                     return;
                 }

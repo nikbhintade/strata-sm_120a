@@ -88,12 +88,13 @@ struct InkMoeWorkspace {
     size_t   raw_bytes = 0;
     int      cap_M    = 0;
 
-    void alloc(int max_M) {
+    void alloc(int max_M, int y_pair_max_M = -1) {
         if (max_M <= cap_M && raw_buf) return;
         free_all();
         cap_M = max_M;
         const size_t M = (size_t)max_M;
         const size_t P = M * kInkTopK;
+        const size_t P_yp = (size_t)((y_pair_max_M > 0 && y_pair_max_M < max_M) ? y_pair_max_M : max_M) * kInkTopK;
         const size_t MT = (size_t)ink_moe_max_tiles(max_M);
         size_t off = 0;
         auto bump = [&](size_t bytes) -> size_t {
@@ -113,7 +114,7 @@ struct InkMoeWorkspace {
         const size_t o_tidx    = bump(P * 4);
         const size_t o_tw      = bump(P * 4);
         const size_t o_hf32    = bump(P * kInkInter * 4);
-        const size_t o_ypair   = bump(P * kInkHidden * 4);
+        const size_t o_ypair   = bump(P_yp * kInkHidden * 4);
         const size_t o_xafp4   = bump(M * (kInkHidden / 64) * sm120::kActFp4SlotBytes);
         const size_t o_hafp4   = bump(P * (kInkInter / 64) * sm120::kActFp4SlotBytes);
         const size_t o_xqmx8   = bump(M * kInkHidden);
@@ -2319,7 +2320,154 @@ __device__ __forceinline__ void ink_moe_sk_tc_kloop(
     }
 }
 
-template <bool GU, int TR>
+inline int ink_gpu_sm_count() {
+    static int s_sms = 0;
+    if (s_sms <= 0) {
+        int dev = 0;
+        cudaDeviceProp p{};
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
+            s_sms = p.multiProcessorCount;
+        }
+        if (s_sms <= 0) s_sms = 36;
+    }
+    return s_sms;
+}
+
+// Per-format specialized S_K INT8 Tensor Core MoE kernel (eliminates 7-way switch bloat + supports TR={16,32,64} + L2 atomicAdd!)
+template <bool GU, int TR, int FMT, bool ATOMIC_OUT = false>
+__global__ void __launch_bounds__(256) k_ink_moe_sk_tc_fmt(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    InkMoeTables tb,
+    const InkQ8_1_G64* __restrict__ act_sk,
+    const float* __restrict__ topk_w,
+    float* __restrict__ out_buf) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    constexpr int kWR      = 128;
+    constexpr int ROWS_N   = GU ? (2 * kInkInter) : kInkHidden;
+    constexpr int NFB      = ROWS_N / kWR;
+    constexpr int N_WN     = TR / 16;
+    constexpr int N_WF     = 8 / N_WN;
+    constexpr int W_PER_WF = kWR / N_WF;
+    constexpr int NI       = W_PER_WF / 16;
+    constexpr int WSTR     = 80;
+    constexpr int ASTR     = 80;
+
+    __shared__ alignas(16) int8_t  s_wq[kWR][WSTR];
+    __shared__ alignas(16) int8_t  s_aq[TR][ASTR];
+    __shared__ float               s_wsc[kWR];
+    __shared__ float               s_ad[TR];
+    __shared__ float               s_as[TR];
+    __shared__ int32_t             s_row[TR];
+    __shared__ float               s_rw[TR];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int wf   = warp / N_WN;
+    const int wn   = warp % N_WN;
+    const int nb0  = 16 * wn;
+    const int g    = lane >> 2;
+    const int tig  = lane & 3;
+
+    const int total_tiles = *tb.n_tiles;
+    const int nwork = total_tiles * NFB;
+
+    for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
+        const int2 tl = tb.tiles[w / NFB];
+        const int fb = w % NFB;
+        const int e = tl.x;
+        const int row0 = tl.y;
+        const InkExpertDev ed = experts[e];
+        const int fmt = GU ? (int)ed.gu_code : (int)ed.dn_code;
+        if (ed.tier > 1 || fmt != FMT) continue;
+        const int nrows = min(TR, tb.off[e + 1] - row0);
+        if (nrows <= 0) continue;
+
+        const uint8_t* body = sec4_base + ed.body_off;
+
+        __syncthreads();
+        if (tid < TR) {
+            if (tid < nrows) {
+                s_row[tid] = GU ? tb.tok_idx[row0 + tid] : (row0 + tid);
+                if constexpr (!GU) s_rw[tid] = topk_w[tb.pairs[row0 + tid]];
+            } else {
+                s_row[tid] = -1;
+                s_ad[tid] = 0.0f; s_as[tid] = 0.0f;
+                if constexpr (!GU) s_rw[tid] = 0.0f;
+                uint32_t* z = reinterpret_cast<uint32_t*>(s_aq[tid]);
+                for (int k = 0; k < 16; ++k) z[k] = 0u;
+            }
+        }
+        __syncthreads();
+
+        float acc[NI][2][4] = {};
+        const bool on0 = nb0 < nrows;
+        const bool on1 = nb0 + 8 < nrows;
+
+        ink_moe_sk_tc_kloop<GU, TR, FMT>(body, ed.dn_off, fb, nrows, tid, wf, nb0, g, tig, on0, on1, act_sk, s_row, s_wq, s_aq, s_wsc, s_ad, s_as, acc);
+
+        if (on0) {
+            if constexpr (GU) {
+                const int fbase = fb * 64 + (W_PER_WF / 2) * wf;
+                float inv_sq[NI];
+#pragma unroll
+                for (int i = 0; i < NI; ++i) {
+                    const int feat = fbase + 8 * i + g;
+                    inv_sq[i] = 1.0f / f16_to_f32(ld16_u(body + feat * 2));
+                }
+#pragma unroll
+                for (int n = 0; n < 2; ++n) {
+                    if (n == 1 && !on1) break;
+#pragma unroll
+                    for (int c = 0; c < 2; ++c) {
+                        const int r = nb0 + 8 * n + 2 * tig + c;
+                        if (r < nrows) {
+                            float* dst = out_buf + (size_t)(row0 + r) * kInkInter;
+#pragma unroll
+                            for (int i = 0; i < NI; ++i) {
+                                dst[fbase + 8 * i + g] = situ_f32(acc[i][n][c], acc[i][n][2 + c]) * inv_sq[i];
+                            }
+                        }
+                    }
+                }
+            } else {
+                const int rbase = fb * kWR + W_PER_WF * wf;
+#pragma unroll
+                for (int n = 0; n < 2; ++n) {
+                    if (n == 1 && !on1) break;
+#pragma unroll
+                    for (int c = 0; c < 2; ++c) {
+                        const int r = nb0 + 8 * n + 2 * tig + c;
+                        if (r < nrows) {
+                            const float sc = s_rw[r];
+                            if constexpr (ATOMIC_OUT) {
+                                float* dst = out_buf + (size_t)tb.tok_idx[row0 + r] * kInkHidden;
+#pragma unroll
+                                for (int i = 0; i < NI; ++i) {
+                                    atomicAdd(&dst[rbase + 16 * i + g + 0], acc[i][n][c] * sc);
+                                    atomicAdd(&dst[rbase + 16 * i + g + 8], acc[i][n][2 + c] * sc);
+                                }
+                            } else {
+                                float* dst = out_buf + (size_t)tb.pairs[row0 + r] * kInkHidden;
+#pragma unroll
+                                for (int i = 0; i < NI; ++i) {
+                                    dst[rbase + 16 * i + g + 0] = acc[i][n][c] * sc;
+                                    dst[rbase + 16 * i + g + 8] = acc[i][n][2 + c] * sc;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#else
+    (void)sec4_base; (void)experts; (void)tb; (void)act_sk; (void)topk_w; (void)out_buf;
+#endif
+}
+
+template <bool GU, int TR, bool ATOMIC_OUT = false>
 __global__ void __launch_bounds__(256) k_ink_moe_sk_tc(
     const uint8_t* __restrict__ sec4_base,
     const InkExpertDev* __restrict__ experts,
@@ -2435,11 +2583,20 @@ __global__ void __launch_bounds__(256) k_ink_moe_sk_tc(
                         const int r = nb0 + 8 * n + 2 * tig + c;
                         if (r < nrows) {
                             const float sc = s_rw[r];
-                            float* dst = out_buf + (size_t)tb.pairs[row0 + r] * kInkHidden;
+                            if constexpr (ATOMIC_OUT) {
+                                float* dst = out_buf + (size_t)tb.tok_idx[row0 + r] * kInkHidden;
 #pragma unroll
-                            for (int i = 0; i < NI; ++i) {
-                                dst[rbase + 16 * i + g + 0] = acc[i][n][c] * sc;
-                                dst[rbase + 16 * i + g + 8] = acc[i][n][2 + c] * sc;
+                                for (int i = 0; i < NI; ++i) {
+                                    atomicAdd(&dst[rbase + 16 * i + g + 0], acc[i][n][c] * sc);
+                                    atomicAdd(&dst[rbase + 16 * i + g + 8], acc[i][n][2 + c] * sc);
+                                }
+                            } else {
+                                float* dst = out_buf + (size_t)tb.pairs[row0 + r] * kInkHidden;
+#pragma unroll
+                                for (int i = 0; i < NI; ++i) {
+                                    dst[rbase + 16 * i + g + 0] = acc[i][n][c] * sc;
+                                    dst[rbase + 16 * i + g + 8] = acc[i][n][2 + c] * sc;
+                                }
                             }
                         }
                     }
@@ -3236,7 +3393,26 @@ inline void launch_ink_moe_router(
     k_ink_router_select_topk8<<<M, 32, 0, st>>>(ws.r_logits, gate_b, ws.topk_idx, ws.topk_w, route_scale, M);
 }
 
-// Shared GPU expert execution helper (bins tier<=1 experts in `experts` and writes weighted outputs to ws.y_pair)
+template <bool GU, int TR, bool ATOMIC_OUT>
+inline void launch_ink_moe_sk_tc_mask(
+    unsigned grid, cudaStream_t st, uint32_t mask,
+    const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
+    const InkQ8_1_G64* act_sk, const float* topk_w, float* out_buf) {
+    if (mask == 0) {
+        k_ink_moe_sk_tc<GU, TR, ATOMIC_OUT><<<grid, 256, 0, st>>>(sec4_base, experts, tb, act_sk, topk_w, out_buf);
+        return;
+    }
+    if (mask & (1u << FMT_S1_5)) k_ink_moe_sk_tc_fmt<GU, TR, FMT_S1_5, ATOMIC_OUT><<<grid, 256, 0, st>>>(sec4_base, experts, tb, act_sk, topk_w, out_buf);
+    if (mask & (1u << FMT_S2_K)) k_ink_moe_sk_tc_fmt<GU, TR, FMT_S2_K, ATOMIC_OUT><<<grid, 256, 0, st>>>(sec4_base, experts, tb, act_sk, topk_w, out_buf);
+    if (mask & (1u << FMT_S3_K)) k_ink_moe_sk_tc_fmt<GU, TR, FMT_S3_K, ATOMIC_OUT><<<grid, 256, 0, st>>>(sec4_base, experts, tb, act_sk, topk_w, out_buf);
+    if (mask & (1u << FMT_S4_K)) k_ink_moe_sk_tc_fmt<GU, TR, FMT_S4_K, ATOMIC_OUT><<<grid, 256, 0, st>>>(sec4_base, experts, tb, act_sk, topk_w, out_buf);
+    if (mask & (1u << FMT_S5_K)) k_ink_moe_sk_tc_fmt<GU, TR, FMT_S5_K, ATOMIC_OUT><<<grid, 256, 0, st>>>(sec4_base, experts, tb, act_sk, topk_w, out_buf);
+    if (mask & (1u << FMT_S6_K)) k_ink_moe_sk_tc_fmt<GU, TR, FMT_S6_K, ATOMIC_OUT><<<grid, 256, 0, st>>>(sec4_base, experts, tb, act_sk, topk_w, out_buf);
+    if (mask & (1u << FMT_S8_K)) k_ink_moe_sk_tc_fmt<GU, TR, FMT_S8_K, ATOMIC_OUT><<<grid, 256, 0, st>>>(sec4_base, experts, tb, act_sk, topk_w, out_buf);
+}
+
+// Shared GPU expert execution helper (bins tier<=1 experts in `experts` and writes weighted outputs to ws.y_pair,
+// or directly accumulates into y_out_atomic via L2 atomicAdd during prefill to eliminate y_pair traffic + k_ink_moe_reduce8!)
 inline void launch_ink_moe_dispatch_only(
     cudaStream_t st,
     const uint8_t* sec4_base,
@@ -3246,7 +3422,8 @@ inline void launch_ink_moe_dispatch_only(
     int M,
     InkMoeWorkspace& ws,
     bool force_exact_dec,
-    bool quant_x_done = false) {
+    bool quant_x_done = false,
+    float* y_out_atomic = nullptr) {
     // For 128-expert Top-8 MoE, M<=16 (all spec verify trees) averages ~1..1.5 tok/active-expert (fast decode kernel);
     // M>=24 (c=32, c=64, prefill) gets 2x-3x speedup from Blackwell sm_120a / INT8 / FP16 Tensor Cores!
     const bool use_sm120_tc = (!force_exact_dec && M >= 24 && sm120::available());
@@ -3254,6 +3431,11 @@ inline void launch_ink_moe_dispatch_only(
     const bool use_wmma_tc  = (!use_sm120_tc && !use_fp16_tc && M >= 24 && ink_has_wmma_f16());
     const int tile_rows = use_wmma_tc ? ((M <= 128) ? 16 : 64)
                                       : ((M <= 128 || use_fp16_tc) ? 16 : 64);
+    const bool do_atomic = (y_out_atomic != nullptr) && use_sm120_tc && !info.has_gguf;
+    if (do_atomic) {
+        INK_CK(cudaMemsetAsync(y_out_atomic, 0, (size_t)M * kInkHidden * sizeof(float), st));
+    }
+    float* dn_dst = do_atomic ? y_out_atomic : ws.y_pair;
     k_ink_moe_bin<<<1, 128, 0, st>>>(experts, ws.topk_idx, M, tile_rows, ws.tb);
 
     const int P = M * kInkTopK;
@@ -3295,12 +3477,12 @@ inline void launch_ink_moe_dispatch_only(
             if (info.has_sf4) {
                 if (!quant_x_done) sm120::quantize_act_fp4(x_f32, M, kInkHidden, ws.xa_fp4, st);
                 sm120::moe_sf4_gu_tc(sec4_base, experts, ws.tb, ws.xa_fp4, ws.ha_fp4, mt, tile_rows, st);
-                sm120::moe_sf4_dn_tc(sec4_base, experts, ws.tb, ws.ha_fp4, ws.topk_w, ws.y_pair, mt, tile_rows, st);
+                sm120::moe_sf4_dn_tc(sec4_base, experts, ws.tb, ws.ha_fp4, ws.topk_w, dn_dst, mt, tile_rows, st, do_atomic);
             }
             if (info.has_mx8) {
                 if (!quant_x_done) sm120::quantize_act_mx8(x_f32, M, kInkHidden, ws.xq_mx8, ws.xsc_mx8, st);
                 sm120::moe_mx8_gu_tc(sec4_base, experts, ws.tb, ws.xq_mx8, ws.xsc_mx8, ws.hq_mx8, ws.hsc_mx8, mt, tile_rows, st);
-                sm120::moe_mx8_dn_tc(sec4_base, experts, ws.tb, ws.hq_mx8, ws.hsc_mx8, ws.topk_w, ws.y_pair, mt, tile_rows, st);
+                sm120::moe_mx8_dn_tc(sec4_base, experts, ws.tb, ws.hq_mx8, ws.hsc_mx8, ws.topk_w, dn_dst, mt, tile_rows, st, do_atomic);
             }
         } else if (use_fp16_tc) {
             const int mt = ink_moe_max_tiles(M, 16);
@@ -3327,13 +3509,21 @@ inline void launch_ink_moe_dispatch_only(
         }
         if (M >= 24 && ink_has_int8_tc()) {
             const int mt = ink_moe_max_tiles(M, tile_rows);
-            const unsigned grid = (unsigned)std::min(std::max(1, mt * 18), 2048);
-            if (tile_rows <= 16) k_ink_moe_sk_tc<true, 16><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, nullptr, ws.h_f32);
-            else                 k_ink_moe_sk_tc<true, 64><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, nullptr, ws.h_f32);
+            const unsigned grid = (unsigned)std::min(std::max(1, mt * 18), std::min(2048, ink_gpu_sm_count() * 8));
+            if (tile_rows <= 16)      launch_ink_moe_sk_tc_mask<true, 16, false>(grid, st, info.sk_gu_mask, sec4_base, experts, ws.tb, ws.xq_sk, nullptr, ws.h_f32);
+            else if (tile_rows <= 32) launch_ink_moe_sk_tc_mask<true, 32, false>(grid, st, info.sk_gu_mask, sec4_base, experts, ws.tb, ws.xq_sk, nullptr, ws.h_f32);
+            else                      launch_ink_moe_sk_tc_mask<true, 64, false>(grid, st, info.sk_gu_mask, sec4_base, experts, ws.tb, ws.xq_sk, nullptr, ws.h_f32);
             const int nblk_h = P * (kInkInter / 64);
             k_ink_quant_q8_1<<<(nblk_h + 7) / 8, 256, 0, st>>>(ws.h_f32, ws.hq_sk, P, kInkInter);
-            if (tile_rows <= 16) k_ink_moe_sk_tc<false, 16><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
-            else                 k_ink_moe_sk_tc<false, 64><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
+            if (do_atomic) {
+                if (tile_rows <= 16)      launch_ink_moe_sk_tc_mask<false, 16, true>(grid, st, info.sk_dn_mask, sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, dn_dst);
+                else if (tile_rows <= 32) launch_ink_moe_sk_tc_mask<false, 32, true>(grid, st, info.sk_dn_mask, sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, dn_dst);
+                else                      launch_ink_moe_sk_tc_mask<false, 64, true>(grid, st, info.sk_dn_mask, sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, dn_dst);
+            } else {
+                if (tile_rows <= 16)      launch_ink_moe_sk_tc_mask<false, 16, false>(grid, st, info.sk_dn_mask, sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, dn_dst);
+                else if (tile_rows <= 32) launch_ink_moe_sk_tc_mask<false, 32, false>(grid, st, info.sk_dn_mask, sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, dn_dst);
+                else                      launch_ink_moe_sk_tc_mask<false, 64, false>(grid, st, info.sk_dn_mask, sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, dn_dst);
+            }
         } else {
             dim3 g32(kInkInter / 32, max_act);
             if (M == 1)       launch_ink_moe_gu_sk_mask<1>(g32, st, info.sk_gu_mask, sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
@@ -3393,11 +3583,13 @@ inline void launch_ink_moe(
     // 1. Exact Top-8 / 128 sigmoid router
     launch_ink_moe_router(st, cublas, gate_w, gate_b, x_f32, M, ws, route_scale, force_exact_dec);
 
-    // 2. Dispatch GPU-resident experts
-    launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false);
+    // 2. Dispatch GPU-resident experts (use L2-resident atomicAdd into y_out during prefill M>=24 to skip y_pair & reduce8!)
+    const bool use_atomic_out = run_reduce8 && !force_exact_dec && M >= 24 && sm120::available() && !info.has_gguf;
+    launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false,
+                                 use_atomic_out ? y_out : nullptr);
 
-    // 3. Deterministic 8-slot weighted sum -> y_out [M, 2304] (skipped when caller fuses reduce8 + post-MLP ShortConv4!)
-    if (run_reduce8) {
+    // 3. Deterministic 8-slot weighted sum -> y_out [M, 2304] (skipped when atomicAdd fused or caller fuses reduce8 + post-MLP ShortConv4!)
+    if (run_reduce8 && !use_atomic_out) {
         dim3 rgrid((kInkHidden + 255) / 256, M);
         k_ink_moe_reduce8<<<rgrid, 256, 0, st>>>(ws.y_pair, y_out, M);
     }
