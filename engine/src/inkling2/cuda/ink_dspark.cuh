@@ -1391,7 +1391,7 @@ struct InkDSpark {
                 return;
             }
         }
-        r.linear(wn, X, Y, B);
+        r.linear(wn, X, Y, B, -1, reuse_x);
     }
 
     // Elastic growth for DSpark Global layer(s) (e.g. layer 1) as sequence length grows!

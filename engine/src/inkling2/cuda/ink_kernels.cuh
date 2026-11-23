@@ -1743,9 +1743,9 @@ __global__ void __launch_bounds__(256) k_ink_sk_to_bf16(const uint8_t* __restric
 
 // Direct register-dequantized S_K (S5_K / S6_K / S8_K) M=1 exact-FP32 GEMV:
 // Reads weights ONCE in registers (zero BF16 VRAM scratch write, zero cuBLAS tile loop, 0.000000 KLD!).
-// 1 warp (32 lanes) per output row, 4 warps (128 threads) per CTA -> grid = (N + 3) / 4.
+// 1 warp (32 lanes) per output row, 8 warps (256 threads) per CTA -> grid = (N + 7) / 8.
 template <int FMT>
-__global__ void __launch_bounds__(128) k_ink_gemv_sk_m1(
+__global__ void __launch_bounds__(256) k_ink_gemv_sk_m1(
     const uint8_t* __restrict__ raw,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -1756,7 +1756,7 @@ __global__ void __launch_bounds__(128) k_ink_gemv_sk_m1(
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int row = blockIdx.x * 4 + warp;
+    const int row = blockIdx.x * 8 + warp;
 
     __shared__ alignas(16) float s_x[4096];
     const bool use_smem = (K <= 4096);
@@ -1764,7 +1764,7 @@ __global__ void __launch_bounds__(128) k_ink_gemv_sk_m1(
         const float4* x4 = reinterpret_cast<const float4*>(x);
         float4* sx4 = reinterpret_cast<float4*>(s_x);
         const int K4 = K >> 2;
-        for (int i = tid; i < K4; i += 128) sx4[i] = x4[i];
+        for (int i = tid; i < K4; i += 256) sx4[i] = x4[i];
         __syncthreads();
     }
     if (row >= N) return;
@@ -1824,11 +1824,13 @@ __global__ void __launch_bounds__(128) k_ink_gemv_sk_m1(
     if (lane == 0) y[row] = acc;
 }
 
-// Direct register-dequantized S_K (S5_K / S6_K / S8_K) Multi-Token DP4A GEMV (M <= MAX_M in {4, 8}):
-// Unpacks each S_K weight superblock ONCE and dots against all M tokens via dp4a_i8!
-// Used for DSpark 7-slot base logits (11.8 ms -> ~1.4 ms!), Verify M=4..8, and S_K dense layers without VRAM scratch!
-template <int FMT, int MAX_M>
-__global__ void __launch_bounds__(128) k_ink_gemv_sk_dp4a(
+// Direct register-dequantized S_K (S5_K / S6_K / S8_K) Multi-Token DP4A GEMV (M <= MAX_M):
+// - 8 warps (256 threads) per CTA -> 8 rows/CTA (high occupancy on 36-SM sm_120!).
+// - Tiled compact SMEM (9 SBs = 36 Q8_1 blocks per tile -> 100% SMEM hits even for K=3072 / K=9216!).
+// - ZERO inner-loop warp shuffles: each lane accumulates eff * d * dp4a locally; lane lg==0 adds -HALF * eff * s;
+//   single 5-step warp_sum per token at the very end!
+template <int FMT, int MAX_M, bool EXACT_M = false>
+__global__ void __launch_bounds__(256) k_ink_gemv_sk_dp4a(
     const uint8_t* __restrict__ raw,
     const InkQ8_1_G64* __restrict__ xq,  // [M, K / 64]
     float* __restrict__ y,               // [M, N]
@@ -1837,64 +1839,78 @@ __global__ void __launch_bounds__(128) k_ink_gemv_sk_dp4a(
     int K) {
     constexpr int SB = ink_sb_bytes(FMT);
     constexpr float HALF = ink_sk_half(FMT);
+    constexpr int TILE_SB = 9;
+    constexpr int TILE_BLK = TILE_SB * 4;  // 36 blocks (2304 elems)
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int row = blockIdx.x * 4 + warp;
+    const int row = blockIdx.x * 8 + warp;
 
-    const int nblk_row = K >> 6;  // K / 64 (36 for K=2304)
-    __shared__ alignas(16) InkQ8_1_G64 s_xq[MAX_M][36];
-    const bool use_smem = (nblk_row <= 36);
-    if (use_smem) {
-        // Copy M * nblk_row * 80 bytes in 16-byte chunks
-        const int tot_u4 = (M * nblk_row * (int)sizeof(InkQ8_1_G64)) >> 4;
-        const uint4* src4 = reinterpret_cast<const uint4*>(xq);
-        uint4* dst4 = reinterpret_cast<uint4*>(&s_xq[0][0]);
-        for (int i = tid; i < tot_u4; i += 128) dst4[i] = src4[i];
-        __syncthreads();
-    }
-    if (row >= N) return;
+    __shared__ alignas(16) uint32_t s_qs[MAX_M][TILE_BLK][16];  // 18.4 KB for MAX_M=8 (16.1 KB for MAX_M=7)
+    __shared__ alignas(8)  float2   s_ds[MAX_M][TILE_BLK];      //  2.3 KB for MAX_M=8
 
     const int nsb = K >> 8;
+    const int nblk_row = K >> 6;
     const uint8_t* rptr = raw + (size_t)row * (size_t)nsb * SB;
     const int g = lane >> 3;     // 0..3
     const int lg = lane & 7;     // 0..7
-    const int in_g = lg * 8;
+    const int q_off = lg * 2;    // uint32 index inside 16-word Q8_1 block
+    const int eff_M = EXACT_M ? MAX_M : M;
 
     float acc[MAX_M] = {};
-    for (int s = 0; s < nsb; ++s) {
-        const uint8_t* blk = rptr + (size_t)s * SB;
-        const float D = f16_to_f32(ld16_u(blk));
-        const float eff = D * ((float)blk[2 + g] * (1.0f / 255.0f));
-        const uint8_t* pl = blk + 6;
-        uint32_t w0, w1;
-        sk_unpack8_lane8<FMT>(pl, g, lg, w0, w1);
+    for (int sb0 = 0; sb0 < nsb; sb0 += TILE_SB) {
+        const int sb_cnt = min(TILE_SB, nsb - sb0);
+        const int blk0 = sb0 * 4;
+        const int blk_cnt = sb_cnt * 4;
+        const int tot_blks = eff_M * blk_cnt;
+        // Cooperative load of tile Q8_1 blocks into compact SMEM (4 uint4 per block = 64B + float2 ds)
+        for (int idx = tid; idx < tot_blks * 4; idx += 256) {
+            const int u4_in_blk = idx & 3;
+            const int lin_blk = idx >> 2;
+            const int tm = lin_blk / blk_cnt;
+            const int tb = lin_blk - tm * blk_cnt;
+            const InkQ8_1_G64& src = xq[(size_t)tm * nblk_row + (blk0 + tb)];
+            reinterpret_cast<uint4*>(&s_qs[tm][tb][0])[u4_in_blk] = reinterpret_cast<const uint4*>(src.qs)[u4_in_blk];
+            if (u4_in_blk == 0) {
+                s_ds[tm][tb] = make_float2(src.d, -HALF * src.s);
+            }
+        }
+        __syncthreads();
 
-        const int blk_idx = s * 4 + g;
+        if (row < N) {
+            for (int s = 0; s < sb_cnt; ++s) {
+                const uint8_t* blk = rptr + (size_t)(sb0 + s) * SB;
+                const float D = f16_to_f32(ld16_u(blk));
+                const float eff = D * ((float)blk[2 + g] * (1.0f / 255.0f));
+                const uint8_t* pl = blk + 6;
+                uint32_t w0, w1;
+                sk_unpack8_lane8<FMT>(pl, g, lg, w0, w1);
+
+                const int tb = s * 4 + g;
 #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (m < M) {
-                const InkQ8_1_G64& xb = use_smem ? s_xq[m][blk_idx] : xq[(size_t)m * nblk_row + blk_idx];
-                const uint2 x2 = *reinterpret_cast<const uint2*>(xb.qs + in_g);
-                int32_t isum = dp4a_i8(w1, x2.y, dp4a_i8(w0, x2.x, 0));
-#pragma unroll
-                for (int o = 4; o >= 1; o >>= 1) isum += __shfl_xor_sync(0xFFFFFFFFu, isum, o);
-                if (lg == 0) {
-                    if constexpr (FMT == FMT_S8_K) {
-                        acc[m] = fmaf(eff, xb.d * (float)isum, acc[m]);
-                    } else {
-                        acc[m] = fmaf(eff, xb.d * (float)isum - HALF * xb.s, acc[m]);
+                for (int m = 0; m < MAX_M; ++m) {
+                    if (EXACT_M || m < M) {
+                        const uint32_t x0 = s_qs[m][tb][q_off];
+                        const uint32_t x1 = s_qs[m][tb][q_off + 1];
+                        const int32_t isum = dp4a_i8(w1, x1, dp4a_i8(w0, x0, 0));
+                        const float2 ds = s_ds[m][tb];
+                        acc[m] = fmaf(eff * ds.x, (float)isum, acc[m]);
+                        if constexpr (FMT != FMT_S8_K) {
+                            if (lg == 0) acc[m] = fmaf(eff, ds.y, acc[m]);
+                        }
                     }
                 }
             }
         }
+        if (sb0 + TILE_SB < nsb) __syncthreads();
     }
+
+    if (row >= N) return;
 #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
-        if (m < M) {
-            acc[m] += __shfl_xor_sync(0xFFFFFFFFu, acc[m], 8);
-            acc[m] += __shfl_xor_sync(0xFFFFFFFFu, acc[m], 16);
-            if (lane == 0) y[(size_t)m * N + row] = acc[m];
+        if (EXACT_M || m < M) {
+            const float s = warp_sum(acc[m]);
+            if (lane == 0) y[(size_t)m * N + row] = s;
         }
     }
 }
