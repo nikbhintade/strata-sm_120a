@@ -123,13 +123,17 @@ __global__ void __launch_bounds__(256) k_dspark_mix_taps_ring(
 }
 
 // Non-causal DSpark Block-8 Attention: attends to committed ctx [c0..apos-1] + all B=8 draft tokens [0..B-1]!
-// Supports compact SWA-1025 ring buffers for layers 0 & 2 and elastic global KV for layer 1!
+// Supports compact SWA-1025 ring buffers (FP16) for layers 0 & 2 and elastic global KV (FP16 or FP8 E4M3) for layer 1!
 __global__ void __launch_bounds__(128) k_dspark_block_attn(
     const float* __restrict__ q,          // [B, 24, 128]
     const float* __restrict__ kd,         // [B, 8, 128]
     const float* __restrict__ vd,         // [B, 8, 128]
-    const __half* __restrict__ ctx_k,     // [ctx_cap, 8, 128]
+    const __half* __restrict__ ctx_k,     // [ctx_cap, 8, 128] (FP16 when ctx_k_f8 == nullptr)
     const __half* __restrict__ ctx_v,     // [ctx_cap, 8, 128]
+    const uint8_t* __restrict__ ctx_k_f8, // [ctx_cap, 8, 128] (FP8 E4M3 when non-null)
+    const uint8_t* __restrict__ ctx_v_f8, // [ctx_cap, 8, 128]
+    const float* __restrict__ ctx_k_sc,   // [ctx_cap, 8]
+    const float* __restrict__ ctx_v_sc,   // [ctx_cap, 8]
     const int32_t* __restrict__ apos_ptr, // [1] committed context length
     bool is_swa,
     int swa_win,                          // 1025
@@ -166,16 +170,48 @@ __global__ void __launch_bounds__(128) k_dspark_block_attn(
         mw = mn;
     };
 
-    for (int kp = c0 + warp; kp < c_end; kp += 4) {
-        const int p_idx = is_swa ? (kp % ctx_cap) : kp;
-        const size_t base = ((size_t)p_idx * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
-        const uint2 k2 = *(const uint2*)(ctx_k + base);
-        const uint2 v2 = *(const uint2*)(ctx_v + base);
-        const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
-        const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
-        const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
-        const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
-        attend(make_float4(kf0.x, kf0.y, kf1.x, kf1.y), make_float4(vf0.x, vf0.y, vf1.x, vf1.y));
+    if (ctx_k_f8) {
+        for (int kp = c0 + warp; kp < c_end; kp += 4) {
+            const int p_idx = is_swa ? (kp % ctx_cap) : kp;
+            const size_t hbase = (size_t)p_idx * kInkKVHeads + kh;
+            const size_t base  = hbase * kInkHeadDim + lane * 4;
+            const float sk = ctx_k_sc[hbase];
+            const float sv = ctx_v_sc[hbase];
+            const uint32_t k4 = *(const uint32_t*)(ctx_k_f8 + base);
+            const uint32_t v4 = *(const uint32_t*)(ctx_v_f8 + base);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+            uint32_t kh0, kh1, vh0, vh1;
+            const uint16_t klo = (uint16_t)(k4 & 0xFFFFu), khi = (uint16_t)(k4 >> 16);
+            const uint16_t vlo = (uint16_t)(v4 & 0xFFFFu), vhi = (uint16_t)(v4 >> 16);
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(kh0) : "h"(klo));
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(kh1) : "h"(khi));
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(vh0) : "h"(vlo));
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(vh1) : "h"(vhi));
+            const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&kh0));
+            const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&kh1));
+            const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&vh0));
+            const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&vh1));
+#else
+            const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
+            const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
+            const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
+            const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4 >> 16));
+#endif
+            attend(make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk),
+                   make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv));
+        }
+    } else {
+        for (int kp = c0 + warp; kp < c_end; kp += 4) {
+            const int p_idx = is_swa ? (kp % ctx_cap) : kp;
+            const size_t base = ((size_t)p_idx * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
+            const uint2 k2 = *(const uint2*)(ctx_k + base);
+            const uint2 v2 = *(const uint2*)(ctx_v + base);
+            const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
+            const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
+            const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
+            const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
+            attend(make_float4(kf0.x, kf0.y, kf1.x, kf1.y), make_float4(vf0.x, vf0.y, vf1.x, vf1.y));
+        }
     }
     for (int j = warp; j < B; j += 4) {
         const size_t base = ((size_t)j * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
@@ -1054,12 +1090,17 @@ struct InkDSpark {
     int max_ctx = 4096;
     int K_cand = 256;  // reduced-vocab L2-cached candidate pool for Markov RNN
 
-    // Context KV cache for 3 DSpark layers (layers 0 & 2 = compact SWA-1025 rings; layer 1 = elastic global!) + compact f_rnn ring!
+    // Context KV cache for 3 DSpark layers (layers 0 & 2 = compact FP16 SWA-1025 rings; layer 1 = elastic global FP16 or FP8!)
     int ctx_cap[3] = {0, 0, 0};
     int frnn_cap = 64;
-    __half* d_ctx_k[3] = {};
-    __half* d_ctx_v[3] = {};
-    float*  d_f_rnn = nullptr;  // [frnn_cap, 2304] (fixed < 5 MiB regardless of max_ctx!)
+    bool ctx_glob_fp8 = false;
+    __half*  d_ctx_k[3] = {};
+    __half*  d_ctx_v[3] = {};
+    uint8_t* d_ctx_k_f8[3] = {};
+    uint8_t* d_ctx_v_f8[3] = {};
+    float*   d_ctx_k_sc[3] = {};
+    float*   d_ctx_v_sc[3] = {};
+    float*   d_f_rnn = nullptr;  // [frnn_cap, 2304] (fixed < 5 MiB regardless of max_ctx!)
 
     // Working buffers for Block-8 forward
     float *d_cur = nullptr, *d_h = nullptr, *d_q = nullptr, *d_k = nullptr, *d_v = nullptr;
@@ -1130,6 +1171,8 @@ struct InkDSpark {
         const int glob_init = (init_glob_ctx > 0) ? std::min(max_ctx, std::max(256, init_glob_ctx)) : std::min(max_ctx, 8192);
         frnn_cap = std::max(64, r.max_batch + 32);
 
+        ctx_glob_fp8 = (r.kv_dtype != InkKvDtype::FP16);
+
         // Pre-check free VRAM so DSpark NEVER crashes with CUDA error 2 (exit 3) on tight 4-16 GB GPUs!
         // Shrink initial global DSpark KV cap (8192 -> 2048 -> 512) before giving up (#6633)!
         int eff_glob_init = glob_init;
@@ -1139,8 +1182,12 @@ struct InkDSpark {
                 auto calc_need = [&](int gcap) -> size_t {
                     size_t kv_need = 0;
                     for (int il = 0; il < 3; ++il) {
-                        const int c = (m.man.c.dspark_is_swa[il] != 0) ? swa_cap : gcap;
-                        kv_need += (size_t)c * kInkKVHeads * kInkHeadDim * 4;
+                        const bool swa = (m.man.c.dspark_is_swa[il] != 0);
+                        const int c = swa ? swa_cap : gcap;
+                        const size_t bpp = (!swa && ctx_glob_fp8)
+                            ? ((size_t)kInkKVHeads * kInkHeadDim * 2u + (size_t)kInkKVHeads * 8u)
+                            : ((size_t)kInkKVHeads * kInkHeadDim * 4u);
+                        kv_need += (size_t)c * bpp;
                     }
                     return kv_need + (size_t)frnn_cap * kInkHidden * 4 + (80ull << 20);
                 };
@@ -1160,9 +1207,18 @@ struct InkDSpark {
             }
         }
         for (int il = 0; il < 3; ++il) {
-            ctx_cap[il] = (m.man.c.dspark_is_swa[il] != 0) ? swa_cap : eff_glob_init;
-            d_ctx_k[il] = dalloc<__half>((size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim);
-            d_ctx_v[il] = dalloc<__half>((size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim);
+            const bool swa = (m.man.c.dspark_is_swa[il] != 0);
+            ctx_cap[il] = swa ? swa_cap : eff_glob_init;
+            const size_t elems = (size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim;
+            if (!swa && ctx_glob_fp8) {
+                d_ctx_k_f8[il] = dalloc<uint8_t>(elems);
+                d_ctx_v_f8[il] = dalloc<uint8_t>(elems);
+                d_ctx_k_sc[il] = dalloc<float>((size_t)ctx_cap[il] * kInkKVHeads);
+                d_ctx_v_sc[il] = dalloc<float>((size_t)ctx_cap[il] * kInkKVHeads);
+            } else {
+                d_ctx_k[il] = dalloc<__half>(elems);
+                d_ctx_v[il] = dalloc<__half>(elems);
+            }
         }
         d_f_rnn = dalloc<float>((size_t)frnn_cap * kInkHidden);
 
@@ -1404,24 +1460,54 @@ struct InkDSpark {
             if (target <= ctx_cap[il]) continue;
             INK_CK(cudaStreamSynchronize(r.st));
             const size_t new_elems = (size_t)target * kInkKVHeads * kInkHeadDim;
-            const size_t old_bytes = (size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim * sizeof(__half);
-            __half *nk = nullptr, *nv = nullptr;
-            if (cudaMalloc(&nk, new_elems * sizeof(__half)) != cudaSuccess ||
-                cudaMalloc(&nv, new_elems * sizeof(__half)) != cudaSuccess) {
-                (void)cudaGetLastError();
-                if (nk) cudaFree(nk);
-                if (nv) cudaFree(nv);
-                std::fprintf(stderr, "[InkDSpark] Tight VRAM while growing global ctx %d -> %d; disabling DSpark gracefully\n",
-                             ctx_cap[il], target);
-                ready = false;
-                return false;
+            if (ctx_glob_fp8) {
+                const size_t old_bytes = (size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim;
+                const size_t new_sc_n  = (size_t)target * kInkKVHeads;
+                const size_t old_sc_b  = (size_t)ctx_cap[il] * kInkKVHeads * sizeof(float);
+                uint8_t *nk = nullptr, *nv = nullptr;
+                float *nks = nullptr, *nvs = nullptr;
+                if (cudaMalloc(&nk, new_elems) != cudaSuccess ||
+                    cudaMalloc(&nv, new_elems) != cudaSuccess ||
+                    cudaMalloc(&nks, new_sc_n * sizeof(float)) != cudaSuccess ||
+                    cudaMalloc(&nvs, new_sc_n * sizeof(float)) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    if (nk) cudaFree(nk);
+                    if (nv) cudaFree(nv);
+                    if (nks) cudaFree(nks);
+                    if (nvs) cudaFree(nvs);
+                    std::fprintf(stderr, "[InkDSpark] Tight VRAM while growing global FP8 ctx %d -> %d; disabling DSpark gracefully\n",
+                                 ctx_cap[il], target);
+                    ready = false;
+                    return false;
+                }
+                INK_CK(cudaMemcpy(nk, d_ctx_k_f8[il], old_bytes, cudaMemcpyDeviceToDevice));
+                INK_CK(cudaMemcpy(nv, d_ctx_v_f8[il], old_bytes, cudaMemcpyDeviceToDevice));
+                INK_CK(cudaMemcpy(nks, d_ctx_k_sc[il], old_sc_b, cudaMemcpyDeviceToDevice));
+                INK_CK(cudaMemcpy(nvs, d_ctx_v_sc[il], old_sc_b, cudaMemcpyDeviceToDevice));
+                cudaFree(d_ctx_k_f8[il]); cudaFree(d_ctx_v_f8[il]);
+                cudaFree(d_ctx_k_sc[il]); cudaFree(d_ctx_v_sc[il]);
+                d_ctx_k_f8[il] = nk; d_ctx_v_f8[il] = nv;
+                d_ctx_k_sc[il] = nks; d_ctx_v_sc[il] = nvs;
+            } else {
+                const size_t old_bytes = (size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim * sizeof(__half);
+                __half *nk = nullptr, *nv = nullptr;
+                if (cudaMalloc(&nk, new_elems * sizeof(__half)) != cudaSuccess ||
+                    cudaMalloc(&nv, new_elems * sizeof(__half)) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    if (nk) cudaFree(nk);
+                    if (nv) cudaFree(nv);
+                    std::fprintf(stderr, "[InkDSpark] Tight VRAM while growing global ctx %d -> %d; disabling DSpark gracefully\n",
+                                 ctx_cap[il], target);
+                    ready = false;
+                    return false;
+                }
+                INK_CK(cudaMemcpy(nk, d_ctx_k[il], old_bytes, cudaMemcpyDeviceToDevice));
+                INK_CK(cudaMemcpy(nv, d_ctx_v[il], old_bytes, cudaMemcpyDeviceToDevice));
+                cudaFree(d_ctx_k[il]);
+                cudaFree(d_ctx_v[il]);
+                d_ctx_k[il] = nk;
+                d_ctx_v[il] = nv;
             }
-            INK_CK(cudaMemcpy(nk, d_ctx_k[il], old_bytes, cudaMemcpyDeviceToDevice));
-            INK_CK(cudaMemcpy(nv, d_ctx_v[il], old_bytes, cudaMemcpyDeviceToDevice));
-            cudaFree(d_ctx_k[il]);
-            cudaFree(d_ctx_v[il]);
-            d_ctx_k[il] = nk;
-            d_ctx_v[il] = nv;
             ctx_cap[il] = target;
             grew = true;
         }
@@ -1458,11 +1544,21 @@ struct InkDSpark {
                 d_kc_tmp, (const float*)m.trunk_ptr(p + ".self_attn.k_norm_ctx.weight"),
                 d_pos, m.man.c.dspark_rope_theta, M, kInkKVHeads);
             InkKvVisitDesc desc{};
-            desc.k_f16 = d_ctx_k[il];
-            desc.v_f16 = d_ctx_v[il];
+            const bool swa = (m.man.c.dspark_is_swa[il] != 0);
             desc.cap_pos = ctx_cap[il];
-            desc.is_swa = (m.man.c.dspark_is_swa[il] != 0);
-            desc.kv_fmt = 0;
+            desc.dev_cap = ctx_cap[il];
+            desc.is_swa  = swa;
+            if (!swa && ctx_glob_fp8) {
+                desc.k_f8   = d_ctx_k_f8[il];
+                desc.v_f8   = d_ctx_v_f8[il];
+                desc.k_sc   = d_ctx_k_sc[il];
+                desc.v_sc   = d_ctx_v_sc[il];
+                desc.kv_fmt = 1;
+            } else {
+                desc.k_f16  = d_ctx_k[il];
+                desc.v_f16  = d_ctx_v[il];
+                desc.kv_fmt = 0;
+            }
             k_ink_kv_write<<<g, 128, 0, r.st>>>(d_kc_tmp, d_vc_tmp, nullptr, 0, d_pos, desc, M);
         }
         k_dspark_mix_taps_ring<<<M, 256, 0, r.st>>>(
@@ -1504,7 +1600,8 @@ struct InkDSpark {
             k_dspark_rmsnorm_rope<<<dim3(kInkKVHeads, B), 128, 0, r.st>>>(
                 d_k, (const float*)m.trunk_ptr(p + ".self_attn.k_norm.weight"), d_pos, m.man.c.dspark_rope_theta, B, kInkKVHeads);
             k_dspark_block_attn<<<dim3(kInkHeads, B), 128, 0, r.st>>>(
-                d_q, d_k, d_v, d_ctx_k[il], d_ctx_v[il], d_apos,
+                d_q, d_k, d_v, d_ctx_k[il], d_ctx_v[il],
+                d_ctx_k_f8[il], d_ctx_v_f8[il], d_ctx_k_sc[il], d_ctx_v_sc[il], d_apos,
                 m.man.c.dspark_is_swa[il] != 0, m.man.c.dspark_swa_win, ctx_cap[il], B, d_attn_out);
             dspark_linear_b8(p + ".self_attn.o_proj.weight", d_attn_out, d_proj, B, false);
             k_ink_add<<<(B * kInkHidden + 255) / 256, 256, 0, r.st>>>(d_cur, d_cur, d_proj, B * kInkHidden);
@@ -1808,8 +1905,12 @@ struct InkDSpark {
         if (d_bf16_pool) { cudaFree(d_bf16_pool); d_bf16_pool = nullptr; }
         if (d_unembed_fp16) { cudaFree(d_unembed_fp16); d_unembed_fp16 = nullptr; }
         for (int il = 0; il < 3; ++il) {
-            if (d_ctx_k[il]) { cudaFree(d_ctx_k[il]); d_ctx_k[il] = nullptr; }
-            if (d_ctx_v[il]) { cudaFree(d_ctx_v[il]); d_ctx_v[il] = nullptr; }
+            if (d_ctx_k[il])    { cudaFree(d_ctx_k[il]);    d_ctx_k[il] = nullptr; }
+            if (d_ctx_v[il])    { cudaFree(d_ctx_v[il]);    d_ctx_v[il] = nullptr; }
+            if (d_ctx_k_f8[il]) { cudaFree(d_ctx_k_f8[il]); d_ctx_k_f8[il] = nullptr; }
+            if (d_ctx_v_f8[il]) { cudaFree(d_ctx_v_f8[il]); d_ctx_v_f8[il] = nullptr; }
+            if (d_ctx_k_sc[il]) { cudaFree(d_ctx_k_sc[il]); d_ctx_k_sc[il] = nullptr; }
+            if (d_ctx_v_sc[il]) { cudaFree(d_ctx_v_sc[il]); d_ctx_v_sc[il] = nullptr; }
         }
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
         fr(d_f_rnn); fr(d_cur); fr(d_h); fr(d_q); fr(d_k); fr(d_v); fr(d_qkv_fused); fr(d_gu_fused); fr(d_attn_out);

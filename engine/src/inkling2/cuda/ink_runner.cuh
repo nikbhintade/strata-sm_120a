@@ -2016,8 +2016,10 @@ struct InkCudaRunner {
             const size_t ws_reserve = base_ws_res + dspark_ws_res + os_kv_pad;
             const size_t avail_glob = (vfree > swa_kv_bytes + sconv_bytes + ws_reserve)
                 ? (vfree - swa_kv_bytes - sconv_bytes - ws_reserve) : 0u;
-            const size_t per_pos_glob = (size_t)std::max(1, n_glob_g0) * max_slots * per_visit_pos
-                                      + (m.man.has_dspark ? (size_t)4096u : 0u);
+            const size_t dspark_per_pos = m.man.has_dspark
+                                        ? ((kv_dtype != InkKvDtype::FP16) ? (size_t)2112u : (size_t)4096u)
+                                        : 0u;
+            const size_t per_pos_glob = (size_t)std::max(1, n_glob_g0) * max_slots * per_visit_pos + dspark_per_pos;
             const int vram_fit_ctx = (n_glob_g0 > 0)
                 ? (int)std::min<size_t>((size_t)max_ctx, (avail_glob / std::max<size_t>(1, per_pos_glob)) & ~(size_t)63)
                 : max_ctx;
