@@ -3216,7 +3216,7 @@ struct InkCudaRunner {
         {
             const int cur_cc = m.ls_active ? m.stage_cc[cur_stage] : m.sm_cc;
             dim3 gr(kInkHeads, M);
-            k_ink_rel_table<<<gr, 256, 0, st>>>(d_r, (const float*)m.trunk_ptr_stage(cur_stage, p + ".attn.rel_logits_proj.proj"), d_rel_table, M);
+            k_ink_rel_table<<<dim3(8, M), 128, 0, st>>>(d_r, (const float*)m.trunk_ptr_stage(cur_stage, p + ".attn.rel_logits_proj.proj"), d_rel_table, M);
             if (M <= 16 || mode == 2) {
                 const int n_sp = (M == 1) ? (is_swa ? 16 : kInkAttnMaxSplits) : kInkAttnSplits;
                 dim3 gsp(kInkKVHeads, n_sp, M);

@@ -311,30 +311,42 @@ __global__ void __launch_bounds__(128) k_ink_post_qkv_fused(
 }
 
 // ---- Precompute relative-position bias table for a batch of M queries:
-//      rel_table[m, h, dist] = sum_{c=0..15} r[m, h, c] * rel_proj_pad[c, dist] for dist in 0..1024!
-//      Grid: (24 heads, M tokens) — wait: 1025 cols = 4 iterations of 256 threads! Only 16 FMAs/thread -> < 5 us!
-__global__ void __launch_bounds__(256) k_ink_rel_table(
+//      rel_table[m, h, dist] = sum_{c=0..15} r[m, h, c] * rel_proj[c, dist] for dist in 0..1023 (col 1024 = 0.0f).
+//      Grid: (8 dist-tiles, M tokens), Block: 128 threads (1 dist/thread, all 24 heads share rel_proj in registers -> 24x less rel_proj BW!)
+__global__ void __launch_bounds__(128) k_ink_rel_table(
     const float* __restrict__ r,          // [M, 24, 16]
-    const float* __restrict__ rel_proj,   // [16, 1024] F32 (note: col 1024 is implicitly 0.0f!)
+    const float* __restrict__ rel_proj,   // [16, 1024] F32 (col 1024 is implicitly 0.0f)
     float* __restrict__ table,            // [M, 24, 1025] F32
     int M) {
     const int m = blockIdx.y;
-    const int h = blockIdx.x;  // 0..23
-    if (m >= M || h >= kInkHeads) return;
-    __shared__ float sr[kInkDRel];
-    if (threadIdx.x < kInkDRel) sr[threadIdx.x] = r[((size_t)m * kInkHeads + h) * kInkDRel + threadIdx.x];
+    const int d = blockIdx.x * 128 + threadIdx.x;  // 0..1023
+    if (m >= M) return;
+    __shared__ float sr[kInkHeads][kInkDRel];  // 24 * 16 * 4 = 1,536 B!
+    const float* rm = r + (size_t)m * kInkHeads * kInkDRel;
+    for (int i = threadIdx.x; i < kInkHeads * kInkDRel; i += 128) {
+        sr[i >> 4][i & 15] = rm[i];
+    }
     __syncthreads();
 
-    float* dst = table + ((size_t)m * kInkHeads + h) * (kInkRelExtent + 1);
-    for (int d = threadIdx.x; d < kInkRelExtent; d += 256) {
-        float acc = 0.0f;
+    if (d < kInkRelExtent) {
+        float acc[kInkHeads] = {};
 #pragma unroll
         for (int c = 0; c < kInkDRel; ++c) {
-            acc = fmaf(sr[c], rel_proj[(size_t)c * kInkRelExtent + d], acc);
+            const float p = rel_proj[(size_t)c * kInkRelExtent + d];
+#pragma unroll
+            for (int h = 0; h < kInkHeads; ++h) {
+                acc[h] = fmaf(sr[h][c], p, acc[h]);
+            }
         }
-        dst[d] = acc;
+        float* base = table + (size_t)m * kInkHeads * (kInkRelExtent + 1) + d;
+#pragma unroll
+        for (int h = 0; h < kInkHeads; ++h) {
+            base[(size_t)h * (kInkRelExtent + 1)] = acc[h];
+        }
     }
-    if (threadIdx.x == 0) dst[kInkRelExtent] = 0.0f;
+    if (blockIdx.x == 0 && threadIdx.x < kInkHeads) {
+        table[((size_t)m * kInkHeads + threadIdx.x) * (kInkRelExtent + 1) + kInkRelExtent] = 0.0f;
+    }
 }
 
 // ---- High-Speed Flash-GQA Kernel (Unified for Decode, Batched Decode B=1..64, Prefill, AND Tree-16 Verify!) ----
